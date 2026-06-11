@@ -1,4 +1,4 @@
-## Founded by MaxRBLX1 — One developer, one mission: make screen recording free and effortless for everyone.
+## Founded by MaxRBLX1 — One developer, one mission: make screen recording free and effortless for everyone. ##
 
 # RetroRec 🎬👻
 
