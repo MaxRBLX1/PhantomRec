@@ -52,8 +52,8 @@ It automatically detects your CPU and screen resolution to deliver silky 60 FPS 
 
 ## Quick Start
 
-1. Download `RetroRec.exe`  
-2. Place `ffmpeg.exe` in the same folder  
+1. Download `RetroRec.rar` from my releases page
+2. Open `RetroRec.ini` to Set your Hotkeys to your liking
 3. Run `RetroRec.exe`  
 4. Press **F12** (or your custom hotkey) to start/stop recording  
 5. Find your videos in `Videos\RetroRec\`
