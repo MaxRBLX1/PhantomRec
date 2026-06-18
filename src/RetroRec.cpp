@@ -1,7 +1,8 @@
-// RetroRec v1.1 — Universal Ghost Screen Recorder
+// RetroRec v1.2 — Universal Ghost Screen Recorder
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// MJPEG Recording | x264 Post-Convert | Zero Drops | Auto-CRF Matrix
+// MJPEG Live Capture | x264 Post-Convert | WASAPI Audio | Zero Drops | Auto-CRF Matrix
+// Audio: Event-driven WASAPI loopback with hardware QPC timestamps (Microsoft sample integration)
 
 #include <windows.h>
 #include <shellapi.h>
@@ -13,16 +14,28 @@
 #include <shlobj.h>
 #include <chrono>
 #include <vector>
+#include <thread>
+#include <fstream>
+#include <cstdint>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <commctrl.h>
+#include <avrt.h>    // MMCSS for real-time audio thread priority
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "avrt.lib")
 
-#define RETROREC_VERSION "1.1.0"
+#define RETROREC_VERSION "1.2.0"
 #define ID_BTN_RECORD 1001
 #define ID_HOTKEY_F12 1
 #define ID_TIMER_UPDATE 2001
 
 struct RetroRec {
+    bool convertAfterRecording = true;
     std::atomic<bool> recording{false};
+    int bufsize = 8000;
     HWND hwnd = nullptr;
     HWND btnRecord = nullptr;
     UINT recordHotkey = VK_F12;
@@ -34,19 +47,40 @@ struct RetroRec {
     std::string tempFile;
     std::string ffmpegPath;
     std::string outputDir;
+    int pipeBufferSizeMB = 8;
     int screenWidth = 1920;
     int screenHeight = 1080;
     int cpuCoreCount = 4;
     int dynamicThreads = 2;
     int crf = 28;
     int maxrate = 4000;
+    int videoQueueSize = 512;
+    int mpeg4Quality = 5;
     std::mutex mtx;
     std::chrono::steady_clock::time_point recStart;
     int sessions = 0;
     long long totalBytes = 0;
     int lastRecordingDurationMs = 0;
     int convertPreset = 0;
+    IAudioClient* audioClient = nullptr;
+    IAudioCaptureClient* captureClient = nullptr;
+    WAVEFORMATEX* waveFormat = nullptr;
+    std::thread audioThread;
+    bool audioActive = false;
+    int audioBitsPerSample = 16;
+    HANDLE hAudioPipeWrite = nullptr;
+    HANDLE hAudioPipeRead = nullptr;
+    HANDLE hAudioSyncEvent = nullptr;
+    HANDLE hAudioReadyEvent = nullptr;  // Event-driven capture: signaled when WASAPI has data
 } app;
+
+// Function declarations
+bool InitializeWASAPI();
+void CleanupWASAPI();
+void AudioToPipeLoop();
+void UpdateUI();
+void SetStatus(const std::string& t);
+void SetButton(const std::string& t);
 
 std::string GetExeDir() {
     char path[MAX_PATH]; GetModuleFileNameA(nullptr, path, MAX_PATH);
@@ -92,10 +126,8 @@ std::string GetVideosFolder() {
     return GetExeDir();
 }
 bool FindFFmpeg() {
-    std::string ucrt = "D:/msys2/ucrt64/bin/ffmpeg.exe";
-    if (FileExists(ucrt)) { app.ffmpegPath = ucrt; return true; }
-    std::string l = GetExeDir() + "\\ffmpeg.exe";
-    if (FileExists(l)) { app.ffmpegPath = l; return true; }
+    std::string local = GetExeDir() + "\\ffmpeg.exe";
+    if (FileExists(local)) { app.ffmpegPath = local; return true; }
     char b[MAX_PATH];
     if (SearchPathA(nullptr, "ffmpeg.exe", nullptr, MAX_PATH, b, nullptr) > 0) {
         app.ffmpegPath = b; return true;
@@ -132,23 +164,18 @@ void ConfigureUniversalPipeline() {
     int cores = si.dwNumberOfProcessors;
     app.cpuCoreCount = cores;
     if (cores <= 2) {
-        app.crf = 30; app.maxrate = 3000; app.dynamicThreads = 1;
+        app.crf = 30; app.maxrate = 3000; app.bufsize = 6000; app.dynamicThreads = 1;
+        app.mpeg4Quality = 5; app.pipeBufferSizeMB = 4; app.videoQueueSize = 512;
     } else if (cores <= 4) {
-        app.crf = 28; app.maxrate = 4000; app.dynamicThreads = 1;
+        app.crf = 28; app.maxrate = 4000; app.bufsize = 8000; app.dynamicThreads = 1;
+        app.mpeg4Quality = 5; app.pipeBufferSizeMB = 8; app.videoQueueSize = 512;
     } else if (cores <= 8) {
-        app.crf = 25; app.maxrate = 6000; app.dynamicThreads = 4;
+        app.crf = 25; app.maxrate = 6000; app.bufsize = 12000; app.dynamicThreads = 4;
+        app.mpeg4Quality = 5; app.pipeBufferSizeMB = 16; app.videoQueueSize = 512;
     } else {
-        app.crf = 20; app.maxrate = 12000; app.dynamicThreads = 8;
+        app.crf = 20; app.maxrate = 12000; app.bufsize = 24000; app.dynamicThreads = 4;
+        app.mpeg4Quality = 5; app.pipeBufferSizeMB = 32; app.videoQueueSize = 512;
     }
-}
-
-bool RunFFmpeg(const std::string& cmd, PROCESS_INFORMATION* pi, DWORD flags) {
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    std::vector<char> cl(cmd.begin(), cmd.end()); cl.push_back('\0');
-    return CreateProcessA(nullptr, cl.data(), nullptr, nullptr, FALSE,
-        flags, nullptr, nullptr, &si, pi);
 }
 
 void SetStatus(const std::string& t) {
@@ -171,8 +198,8 @@ void UpdateUI() {
             std::chrono::steady_clock::now() - app.recStart).count();
         SetButton("■ STOP (" + hotkey + ")");
         std::string status = "● REC " + FormatTime((int)e);
-        status += "\r\nCRF: " + std::to_string(app.crf);
-        status += " | " + std::to_string(app.maxrate) + "k";
+        if (app.audioActive) status += "\r\n🎤 Pipe Audio Active";
+        status += "\r\nMJPEG + PCM Capture → x264 Post-Convert";
         SetStatus(status);
         SendMessage(app.progressBar, PBM_SETMARQUEE, 1, 0);
     } else {
@@ -180,10 +207,10 @@ void UpdateUI() {
         std::string s = "✓ Ready — " + hotkey + " to record\r\n\r\n";
         s += "Cores: " + std::to_string(app.cpuCoreCount);
         s += " | Threads: " + std::to_string(app.dynamicThreads);
-        s += "\r\nCRF: " + std::to_string(app.crf);
+        s += "\r\nTarget CRF: " + std::to_string(app.crf);
         s += " | Bitrate: " + std::to_string(app.maxrate) + "k";
         s += "\r\n" + std::to_string(app.screenWidth) + "x" + std::to_string(app.screenHeight);
-        s += "\r\nMJPEG | DDAGrab | VFR";
+        s += "\r\nMJPEG → x264 Pipeline | Live WASAPI Pipe";
         s += "\r\nBuilt by MaxRBLX1";
         if (app.sessions > 0) s += "\r\nSessions: " + std::to_string(app.sessions);
         SetStatus(s);
@@ -191,6 +218,140 @@ void UpdateUI() {
     }
 }
 
+// ============================================================
+// WASAPI AUDIO CAPTURE (Event-Driven — Microsoft Sample Pattern)
+// ============================================================
+bool InitializeWASAPI() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE) return false;
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+    if (FAILED(hr)) { CoUninitialize(); return false; }
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr)) { enumerator->Release(); CoUninitialize(); return false; }
+    hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&app.audioClient);
+    device->Release(); enumerator->Release();
+    if (FAILED(hr)) { CoUninitialize(); return false; }
+    hr = app.audioClient->GetMixFormat(&app.waveFormat);
+    if (FAILED(hr)) { app.audioClient->Release(); app.audioClient = nullptr; CoUninitialize(); return false; }
+
+    // Create the event that WASAPI will signal when audio data is ready
+    app.hAudioReadyEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!app.hAudioReadyEvent) {
+        app.audioClient->Release(); app.audioClient = nullptr;
+        CoUninitialize(); return false;
+    }
+
+    // Initialize with EVENTCALLBACK — thread wakes only when data is available
+    hr = app.audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        0, 0, app.waveFormat, nullptr);
+    if (FAILED(hr)) {
+        CoTaskMemFree(app.waveFormat); app.waveFormat = nullptr;
+        app.audioClient->Release(); app.audioClient = nullptr;
+        CloseHandle(app.hAudioReadyEvent); app.hAudioReadyEvent = nullptr;
+        CoUninitialize(); return false;
+    }
+
+    // Tell WASAPI which event to signal
+    hr = app.audioClient->SetEventHandle(app.hAudioReadyEvent);
+    if (FAILED(hr)) {
+        CoTaskMemFree(app.waveFormat); app.waveFormat = nullptr;
+        app.audioClient->Release(); app.audioClient = nullptr;
+        CloseHandle(app.hAudioReadyEvent); app.hAudioReadyEvent = nullptr;
+        CoUninitialize(); return false;
+    }
+
+    hr = app.audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&app.captureClient);
+    if (FAILED(hr)) {
+        CoTaskMemFree(app.waveFormat); app.waveFormat = nullptr;
+        app.audioClient->Release(); app.audioClient = nullptr;
+        CloseHandle(app.hAudioReadyEvent); app.hAudioReadyEvent = nullptr;
+        CoUninitialize(); return false;
+    }
+
+    if (app.waveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        WAVEFORMATEXTENSIBLE* ex = (WAVEFORMATEXTENSIBLE*)app.waveFormat;
+        app.audioBitsPerSample = (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? 32 : 16;
+    } else if (app.waveFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        app.audioBitsPerSample = 32;
+    }
+
+    app.audioClient->Start();
+    app.audioActive = true;
+    return true;
+}
+
+void AudioToPipeLoop() {
+    // Register with MMCSS for real-time audio thread priority
+    DWORD taskIndex = 0;
+    HANDLE hAvrt = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
+
+    UINT32 packetLength = 0;
+    bool firstPacketSent = false;
+
+    while (app.recording) {
+        // Wait for WASAPI to signal that audio data is ready (NO polling!)
+        DWORD waitResult = WaitForSingleObject(app.hAudioReadyEvent, 1000);
+        if (waitResult != WAIT_OBJECT_0) {
+            if (!app.recording) break;  // Recording stopped
+            continue;  // Timeout — just loop and wait again
+        }
+
+        HRESULT hr = app.captureClient->GetNextPacketSize(&packetLength);
+        if (FAILED(hr)) break;
+
+        while (packetLength > 0) {
+            BYTE* data;
+            UINT32 frames;
+            DWORD flags;
+            UINT64 devicePosition = 0;
+            UINT64 qpcTimestamp = 0;  // Hardware QPC timestamp from Microsoft sample pattern
+
+            hr = app.captureClient->GetBuffer(&data, &frames, &flags, &devicePosition, &qpcTimestamp);
+            if (SUCCEEDED(hr)) {
+                size_t size = frames * app.waveFormat->nBlockAlign;
+                BYTE* writeData = data;
+                std::vector<BYTE> silence;
+                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                    silence.assign(size, 0);
+                    writeData = silence.data();
+                }
+
+                DWORD written = 0;
+                WriteFile(app.hAudioPipeWrite, writeData, (DWORD)size, &written, nullptr);
+                app.captureClient->ReleaseBuffer(frames);
+
+                if (!firstPacketSent && written > 0) {
+                    if (app.hAudioSyncEvent) SetEvent(app.hAudioSyncEvent);
+                    firstPacketSent = true;
+                }
+            }
+            hr = app.captureClient->GetNextPacketSize(&packetLength);
+            if (FAILED(hr)) break;
+        }
+    }
+
+    if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
+}
+
+void CleanupWASAPI() {
+    if (app.audioActive) {
+        app.audioClient->Stop();
+        if (app.captureClient) { app.captureClient->Release(); app.captureClient = nullptr; }
+        if (app.audioClient) { app.audioClient->Release(); app.audioClient = nullptr; }
+        if (app.waveFormat) { CoTaskMemFree(app.waveFormat); app.waveFormat = nullptr; }
+        if (app.hAudioReadyEvent) { CloseHandle(app.hAudioReadyEvent); app.hAudioReadyEvent = nullptr; }
+        app.audioActive = false;
+        CoUninitialize();
+    }
+}
+
+// ============================================================
+// CORE RECORDING ENGINE
+// ============================================================
 void StartRecording() {
     std::lock_guard<std::mutex> l(app.mtx);
     if (app.recording) return;
@@ -204,25 +365,83 @@ void StartRecording() {
     app.tempFile = app.outputDir + "\\" + ts + "_temp.mkv";
     app.finalFile = app.outputDir + "\\" + ts + ".mkv";
 
+    // 1. Initialize WASAPI and start audio capture
+    bool wasapiReady = InitializeWASAPI();
+    if (wasapiReady) {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        CreatePipe(&app.hAudioPipeRead, &app.hAudioPipeWrite, &sa, app.pipeBufferSizeMB * 1024 * 1024);
+        SetHandleInformation(app.hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
+    }
+
+    std::string audioFormat = "s16le";
+    int sampleRate = 48000;
+    int channels = 2;
+    if (wasapiReady && app.waveFormat) {
+        audioFormat = (app.audioBitsPerSample == 32) ? "f32le" : "s16le";
+        sampleRate = app.waveFormat->nSamplesPerSec;
+        channels = app.waveFormat->nChannels;
+    }
+
+    // 2. Start audio thread FIRST — pipe has data before FFmpeg opens it
+    app.recording = true;
+    if (wasapiReady) {
+        app.audioThread = std::thread(AudioToPipeLoop);
+    }
+
+    // 3. Build command — v1.1 quoting style, DDAGrab capture
     std::ostringstream c;
     c << "cmd.exe /c \"" 
       << "\"" << app.ffmpegPath << "\" -y -rtbufsize 2000M"
+      << " -use_wallclock_as_timestamps 1"
+      << " -thread_queue_size " << app.videoQueueSize
       << " -f lavfi -i ddagrab="
       << "framerate=60:video_size=" << app.screenWidth << "x" << app.screenHeight
-      << ":draw_mouse=1:output_idx=0:output_fmt=bgra:allow_fallback=1:dup_frames=0"
-      << " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
+      << ":draw_mouse=1:output_idx=0:output_fmt=bgra:allow_fallback=1:dup_frames=0";
+
+    if (wasapiReady) {
+        c << " -thread_queue_size 4096"
+          << " -f " << audioFormat << " -ar " << sampleRate << " -ac " << channels << " -i pipe:0";
+    }
+
+    c << " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
       << " -vf \"hwdownload,format=bgra,format=yuv420p\""
-      << " -c:v mjpeg -q:v 5"
-      << " -threads " << app.dynamicThreads
+      << " -c:v mjpeg -q:v 8";
+
+    if (wasapiReady) {
+        c << " -c:a copy";
+    }
+
+    c << " -threads " << app.dynamicThreads
       << " -f matroska \"" << app.tempFile << "\""
+      << " -fflags +genpts"
       << "\"";
 
-    if (!RunFFmpeg(c.str(), &app.ffmpegProcess, CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS)) {
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    if (wasapiReady && app.hAudioPipeRead != nullptr) {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput = app.hAudioPipeRead;
+    }
+    si.wShowWindow = SW_HIDE;
+
+    std::string cmdStr = c.str();
+    std::vector<char> cl(cmdStr.begin(), cmdStr.end());
+    cl.push_back('\0');
+
+    // 4. Spawn FFmpeg — audio is already flowing into the pipe
+    if (!CreateProcessA(nullptr, cl.data(), nullptr, nullptr, TRUE,
+        CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si, &app.ffmpegProcess)) {
+        app.recording = false;
+        if (wasapiReady) {
+            if (app.audioThread.joinable()) app.audioThread.join();
+            CleanupWASAPI();
+        }
         SetStatus("✗ Failed"); return;
     }
 
+    if (app.hAudioPipeRead) { CloseHandle(app.hAudioPipeRead); app.hAudioPipeRead = nullptr; }
+
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-    app.recording = true;
     app.recStart = std::chrono::steady_clock::now();
     app.sessions++;
     SetTimer(app.hwnd, ID_TIMER_UPDATE, 1000, nullptr);
@@ -239,7 +458,24 @@ void StopRecording() {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - app.recStart).count();
     app.lastRecordingDurationMs = (int)elapsed;
+
     app.recording = false;
+    // Wake up the audio thread immediately so it can exit
+    if (app.hAudioReadyEvent) {
+        SetEvent(app.hAudioReadyEvent);
+    }
+
+    // Wait for the audio thread to finish before touching the pipe or WASAPI
+    if (app.audioThread.joinable()) {
+        app.audioThread.join();
+    }
+
+    // Now safe to close the pipe and clean up
+    if (app.hAudioPipeWrite) {
+        CloseHandle(app.hAudioPipeWrite);
+        app.hAudioPipeWrite = nullptr;
+    }
+    CleanupWASAPI();
 
     if (app.ffmpegProcess.hProcess) {
         SetConsoleCtrlHandler(nullptr, TRUE);
@@ -256,9 +492,9 @@ void StopRecording() {
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
     Sleep(500);
 
-    if (FileExists(app.tempFile) && GetFileSize(app.tempFile) > 2048) {
-        std::string presetName = (app.convertPreset == 0) ? "fast" : "medium";
-        SetStatus("⏳ Converting (" + presetName + ")...");
+    // STAGE 2: Convert MPEG-1 + PCM → x264 + AAC CFR
+    if (app.convertAfterRecording && FileExists(app.tempFile) && GetFileSize(app.tempFile) > 2048) {
+        SetStatus("⏳ Converting (ultrafast)...");
         SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
 
         HANDLE hRead, hWrite;
@@ -272,10 +508,12 @@ void StopRecording() {
 
         char cmdLine[4096];
         sprintf_s(cmdLine, sizeof(cmdLine),
-            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -i \"%s\" -c:v libx264 -preset %s -crf 23 -pix_fmt yuv420p -threads %d \"%s\"\"",
+            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -i \"%s\" -fps_mode cfr -r 60 -c:v libx264 -preset ultrafast -crf %d -maxrate %dk -bufsize %dk -c:a aac -b:a 128k -pix_fmt yuv420p -threads %d \"%s\"\"",
             app.ffmpegPath.c_str(),
             app.tempFile.c_str(),
-            presetName.c_str(),
+            app.crf,
+            app.maxrate,
+            app.bufsize,
             conversionThreads,
             app.finalFile.c_str()
         );
@@ -288,13 +526,11 @@ void StopRecording() {
         siConv.wShowWindow = SW_HIDE;
 
         PROCESS_INFORMATION convertPI;
-
         if (CreateProcessA(nullptr, cmdLine, nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+            CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
             nullptr, nullptr, &siConv, &convertPI)) {
 
             CloseHandle(hWrite);
-
             char buf[512];
             std::string lineBuffer;
             DWORD bytesRead;
@@ -314,13 +550,21 @@ void StopRecording() {
                             int percent = (totalDurationUs > 0) ? (int)((timeUs * 100) / totalDurationUs) : 0;
                             if (percent > 100) percent = 100;
                             SendMessage(app.progressBar, PBM_SETPOS, percent, 0);
-                            SetStatus("⏳ Converting (" + presetName + ")... " + std::to_string(percent) + "%");
+                            SetStatus("⏳ Converting (ultrafast)... " + std::to_string(percent) + "%");
                         } catch (...) {}
                     }
                 }
             }
             CloseHandle(hRead);
-            WaitForSingleObject(convertPI.hProcess, INFINITE);
+
+            while (WaitForSingleObject(convertPI.hProcess, 100) == WAIT_TIMEOUT) {
+                MSG msg;
+                while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+            }
+
             CloseHandle(convertPI.hProcess);
             CloseHandle(convertPI.hThread);
             DeleteFileA(app.tempFile.c_str());
@@ -329,6 +573,8 @@ void StopRecording() {
             CloseHandle(hWrite);
             MoveFileA(app.tempFile.c_str(), app.finalFile.c_str());
         }
+    } else if (FileExists(app.tempFile) && GetFileSize(app.tempFile) > 2048) {
+        MoveFileA(app.tempFile.c_str(), app.finalFile.c_str());
     }
 
     long long fs = GetFileSize(app.finalFile);
@@ -353,8 +599,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         app.progressBar = CreateWindowA("msctls_progress32", "",
             WS_VISIBLE|WS_CHILD|PBS_MARQUEE, 20,235,340,15, h, nullptr, nullptr, nullptr);
         RegisterHotKey(h, ID_HOTKEY_F12, app.hotkeyModifiers, app.recordHotkey);
-        std::string btnText = "▶ START (" + GetHotkeyName() + ")";
-        SetButton(btnText);
+        SetButton("▶ START (" + GetHotkeyName() + ")");
         UpdateUI();
         return 0;
     }
@@ -383,6 +628,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
         MessageBoxA(nullptr, "Place ffmpeg.exe next to RetroRec.exe", "RetroRec", MB_OK);
         return 0;
     }
+    std::string iniPath = GetExeDir() + "\\RetroRec.ini";
+    char buf[32];
+    GetPrivateProfileStringA("Settings", "ConvertAfterRecording", "yes", buf, sizeof(buf), iniPath.c_str());
+    app.convertAfterRecording = (strcmp(buf, "no") != 0);
+    GetPrivateProfileStringA("Settings", "ConvertPreset", "fast", buf, sizeof(buf), iniPath.c_str());
+    if (strcmp(buf, "medium") == 0) app.convertPreset = 1;
+
+    ConfigureUniversalPipeline();
+
     WNDCLASSEXA wc = { sizeof(wc) };
     wc.lpfnWndProc = WndProc; wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -399,5 +653,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     ShowWindow(app.hwnd, nCmdShow);
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    CleanupWASAPI();
     return 0;
 }
