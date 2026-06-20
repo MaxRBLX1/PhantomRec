@@ -146,6 +146,10 @@ g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 \
     -ladvapi32 -lole32 -luuid -lksuser -lavrt
 ```
 
+```MSVC (Recommended)
+	cl /std:c++17 /O2 /D_WIN32_WINNT=0x0A00 /EHsc /Fe:RetroRec.exe src\RetroRec.cpp /link /SUBSYSTEM:WINDOWS comctl32.lib shell32.lib user32.lib gdi32.lib kernel32.lib advapi32.lib ole32.lib uuid.lib ksuser.lib avrt.lib windowsapp.lib
+```
+
 > ⚠️ **Important:** The `-D_WIN32_WINNT=0x0A00` flag is strictly required. Without it, the binary targets Windows XP compatibility, causing the recording pipeline to fail with 0 FPS.
 
 ---
