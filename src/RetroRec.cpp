@@ -1,8 +1,8 @@
-// RetroRec v1.5 — Universal Ghost Screen Recorder
+// RetroRec v1.6 — Universal Ghost Screen Recorder
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// GFX Live Capture | x264 Post-Convert | WASAPI Audio | Zero Drops | Auto-CRF Matrix
-// v1.5: Persistent warm FFmpeg + Async conversion + Pause/Resume + Audio‑first startup
+// Max'sEngine™ | GFX/DDAGrab/GDI Capture | x264 Post-Convert | WASAPI Audio | Zero Drops | Auto-CRF Matrix
+// v1.6: Multi-API capture fallback + maxsengine.exe rename + GDI 55 FPS sweet spot
 
 #include <windows.h>
 #include <shellapi.h>
@@ -29,7 +29,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "avrt.lib")
 
-#define RETROREC_VERSION "1.5.0"
+#define RETROREC_VERSION "1.6.0"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -49,16 +49,15 @@
 #define ID_BTN_COLOR 1010
 #define WM_APP_REFRESH_FONTS (WM_APP + 10)
 
-
 struct RetroRec {
     bool convertAfterRecording = true;
     std::atomic<bool> recording{false};
     std::atomic<bool> paused{false};
-	std::chrono::steady_clock::time_point pauseTime;
-	std::chrono::milliseconds totalPausedDuration{0};
-	std::vector<std::string> segmentFiles;
-	int pauseSegmentCount = 0;
-	std::string segmentBaseName;
+    std::chrono::steady_clock::time_point pauseTime;
+    std::chrono::milliseconds totalPausedDuration{0};
+    std::vector<std::string> segmentFiles;
+    int pauseSegmentCount = 0;
+    std::string segmentBaseName;
     std::atomic<bool> converting{false};
     std::atomic<int> convertProgress{0};
     int bufsize = 8000;
@@ -71,7 +70,7 @@ struct RetroRec {
     PROCESS_INFORMATION ffmpegProcess = {0};
     std::string finalFile;
     std::string tempFile;
-    std::string ffmpegPath;
+    std::string maxsenginePath;
     std::string outputDir;
     std::string iniPath;
     int pipeBufferSizeMB = 8;
@@ -87,7 +86,7 @@ struct RetroRec {
     int sessions = 0;
     long long totalBytes = 0;
     int lastRecordingDurationMs = 0;
-    int convertPreset = 0;
+    int convertPreset = 2;
     IAudioClient* audioClient = nullptr;
     IAudioCaptureClient* captureClient = nullptr;
     WAVEFORMATEX* waveFormat = nullptr;
@@ -110,8 +109,12 @@ struct RetroRec {
     Gdiplus::Image* gifImage = nullptr;
     UINT gifFrameCount = 0;
     UINT gifCurrentFrame = 0;
-    int customFontColor = 0xFFFFFF; // Default white
+    int customFontColor = 0xFFFFFF;
     COLORREF customColorRef = RGB(255, 255, 255);
+    int captureMethod = 0; // 0=gfx, 1=ddagrab, 2=gdi
+    std::string audioFormat = "s16le";       // ADD THIS
+    int audioSampleRate = 48000;             // ADD THIS
+    int audioChannels = 2; 
 } app;
 
 // ── Function declarations ─────────────────────────────────
@@ -125,13 +128,74 @@ void LoadConfiguration();
 void CleanupOrphanedTempFiles();
 void CreateDefaultIni();
 void ReloadIniIfChanged();
-void SpawnWarmFFmpeg();
+void SpawnWarmEngine();
 void OpenSettingsWindow();
 LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l);
 void LoadCustomizations();
 void SaveCustomizations();
 void ApplyBackground(HWND previewWnd, const std::string& path);
 void ApplyFont(HWND previewWnd, const std::string& path, int size);
+std::string GetCaptureInput();
+std::string GetCaptureFilter();
+int GetCaptureQuality();
+
+// ── Reliable Windows version detection ────────────────────
+int GetWindowsVersion() {
+    // Returns: 10 = Win10/11, 8 = Win8/8.1, 7 = Win7, 0 = unknown
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) { cached = 0; return 0; }
+    
+    typedef LONG (WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+    auto RtlGetVersion = (RtlGetVersionPtr)GetProcAddress(ntdll, "RtlGetVersion");
+    if (!RtlGetVersion) { cached = 0; return 0; }
+    
+    RTL_OSVERSIONINFOW osvi = { sizeof(osvi) };
+    if (RtlGetVersion(&osvi) != 0) { cached = 0; return 0; }
+    
+    if (osvi.dwMajorVersion >= 10) cached = 10;
+    else if (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion >= 2) cached = 8;
+    else if (osvi.dwMajorVersion == 6 && osvi.dwMinorVersion == 1) cached = 7;
+    else cached = 0;
+    
+    return cached;
+}
+
+// ── Capture method helpers (UPDATED) ──────────────────────
+std::string GetCaptureInput() {
+    int winVer = GetWindowsVersion();
+    if (winVer >= 10) {
+        app.captureMethod = 0;
+        return " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1";
+    } else if (winVer >= 8) {
+        app.captureMethod = 1;
+        return " -f lavfi -i ddagrab=0";
+    } else {
+        app.captureMethod = 2;
+        return " -f gdigrab -framerate 55 -i desktop";
+    }
+}
+
+std::string GetCaptureFilter() {
+    if (app.captureMethod == 0) {
+        // gfxcapture: GPU zero-copy, hardware download
+        return " -vf \"hwdownload,format=bgra,mpdecimate,format=yuv420p\"";
+    } else if (app.captureMethod == 1) {
+        // ddagrab: DirectDraw, needs hwdownload
+        return " -vf \"hwdownload,format=bgra,mpdecimate,format=yuv420p\"";
+    } else {
+        // GDI: CPU-based, aggressive mpdecimate
+        return " -vf \"mpdecimate=hi=64:lo=64:frac=0.33,format=yuv420p\"";
+    }
+}
+
+int GetCaptureQuality() {
+    if (app.captureMethod == 0) return 2; // gfxcapture: best quality
+    if (app.captureMethod == 1) return 2; // ddagrab: same quality as gfx
+    return 5; // GDI: lighter encode for older CPUs
+}
 
 // ── Utility functions ─────────────────────────────────────
 std::string GetExeDir() {
@@ -186,43 +250,45 @@ std::string GetVideosFolder() {
     return GetExeDir();
 }
 
-bool FindFFmpeg() {
-    std::string local = GetExeDir() + "\\ffmpeg.exe";
-    if (FileExists(local)) { app.ffmpegPath = local; return true; }
-    char b[MAX_PATH];
-    if (SearchPathA(nullptr, "ffmpeg.exe", nullptr, MAX_PATH, b, nullptr) > 0) {
-        app.ffmpegPath = b;
-        return true;
-    }
+bool FindMaxsEngine() {
+    // Only look in the same folder as RetroRec.exe
+    // No system PATH search — avoids false positives
+    
+    std::string local = GetExeDir() + "\\maxsengine.exe";
+    if (FileExists(local)) { app.maxsenginePath = local; return true; }
+    
+    std::string legacy = GetExeDir() + "\\ffmpeg.exe";
+    if (FileExists(legacy)) { app.maxsenginePath = legacy; return true; }
+    
     return false;
 }
 
 void PlayNotificationSound() {
-    // Play the Windows "Notification" system sound
-    // This tells the user: "RetroRec is ready, not broken"
     MessageBeep(MB_ICONINFORMATION);
-    // Alternative: Play Windows default beep
-    // Beep(800, 200);
 }
 
-// ── INI file helpers ──────────────────────────────────────
 void CreateDefaultIni() {
     std::ofstream ini(app.iniPath);
     ini << "; ========================================\r\n"
-        << "; RetroRec v1.5 Configuration\r\n"
+        << "; RetroRec v1.6 Configuration\r\n"
         << "; Made by MaxRBLX1\r\n"
+        << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
+        << "; Capture: Auto-detected by Windows version\r\n"
+        << ";   Win10+:  gfxcapture (D3D11 zero-copy)\r\n"
+        << ";   Win8+:   ddagrab (DirectDraw)\r\n"
+        << ";   Win7:    gdigrab (55 FPS software)\r\n"
         << "; Hotkey: F1-F12 for function keys\r\n"
         << ";         A-Z for Ctrl+Letter hotkeys\r\n"
         << "; PauseHotkey: Same format as Hotkey\r\n"
         << "; ConvertAfterRecording: yes or no\r\n"
-        << "; ConvertPreset: fast or medium\r\n"
+        << "; ConvertPreset: ultrafast, veryfast, or medium\r\n"
         << "; ========================================\r\n\r\n"
         << "[Settings]\r\n"
         << "Hotkey=F10\r\n"
         << "PauseHotkey=P\r\n"
         << "ConvertAfterRecording=yes\r\n"
-        << "ConvertPreset=fast\r\n";
+        << "ConvertPreset=medium\r\n";  // ← medium default
     ini.close();
 }
 
@@ -263,21 +329,21 @@ UINT GetHotkeyModifiers(UINT vk) {
 
 void LoadConfiguration() {
     char buf[32];
-
     GetPrivateProfileStringA("Settings", "Hotkey", "F10", buf, sizeof(buf), app.iniPath.c_str());
     app.recordHotkey = ParseHotkey(buf);
     if (app.recordHotkey == 0) app.recordHotkey = VK_F10;
-
     GetPrivateProfileStringA("Settings", "PauseHotkey", "P", buf, sizeof(buf), app.iniPath.c_str());
     app.pauseHotkey = ParseHotkey(buf);
     if (app.pauseHotkey == 0) app.pauseHotkey = 'P';
-
     GetPrivateProfileStringA("Settings", "ConvertAfterRecording", "yes", buf, sizeof(buf), app.iniPath.c_str());
     app.convertAfterRecording = (strcmp(buf, "no") != 0);
-
-    GetPrivateProfileStringA("Settings", "ConvertPreset", "fast", buf, sizeof(buf), app.iniPath.c_str());
-    app.convertPreset = (strcmp(buf, "medium") == 0) ? 1 : 0;
-
+    
+    // Three presets: 0=ultrafast, 1=veryfast, 2=medium (default)
+    GetPrivateProfileStringA("Settings", "ConvertPreset", "medium", buf, sizeof(buf), app.iniPath.c_str());
+    if (strcmp(buf, "ultrafast") == 0) app.convertPreset = 0;
+    else if (strcmp(buf, "veryfast") == 0) app.convertPreset = 1;
+    else app.convertPreset = 2; // medium or anything else
+    
     HANDLE hFile = CreateFileA(app.iniPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -292,22 +358,15 @@ void ReloadIniIfChanged() {
         if (CompareFileTime(&attr.ftLastWriteTime, &app.iniLastWrite) != 0) {
             app.iniLastWrite = attr.ftLastWriteTime;
             LoadConfiguration();
-            
             UINT oldRecord = app.recordHotkey;
             UINT oldPause = app.pauseHotkey;
-            
             UnregisterHotKey(app.hwnd, ID_HOTKEY_RECORD);
             UnregisterHotKey(app.hwnd, ID_HOTKEY_PAUSE);
-
             UINT recMod = GetHotkeyModifiers(app.recordHotkey);
             RegisterHotKey(app.hwnd, ID_HOTKEY_RECORD, recMod, app.recordHotkey);
-
             UINT pauseMod = GetHotkeyModifiers(app.pauseHotkey);
             RegisterHotKey(app.hwnd, ID_HOTKEY_PAUSE, pauseMod, app.pauseHotkey);
-
             UpdateUI();
-            
-            // Only invalidate if hotkeys actually changed
             if (oldRecord != app.recordHotkey || oldPause != app.pauseHotkey) {
                 InvalidateRect(app.hwnd, nullptr, TRUE);
             }
@@ -325,7 +384,22 @@ void ConfigureUniversalPipeline() {
     SYSTEM_INFO si; GetSystemInfo(&si);
     int cores = si.dwNumberOfProcessors;
     app.cpuCoreCount = cores;
-    if (cores <= 2) {
+    
+    int winVer = GetWindowsVersion();
+    
+    if (winVer == 7) {
+        // Windows 7 + GDI: light everything
+        app.crf = 26; app.maxrate = 3000; app.bufsize = 6000;
+        app.dynamicThreads = 1;
+        app.pipeBufferSizeMB = 2; app.videoQueueSize = 256;
+        app.convertPreset = 0; // ultrafast
+    } else if (winVer == 8) {
+        // Windows 8 + ddagrab: medium-light
+        app.crf = 26; app.maxrate = 4000; app.bufsize = 8000;
+        app.dynamicThreads = 1;
+        app.pipeBufferSizeMB = 4; app.videoQueueSize = 512;
+        app.convertPreset = 0; // ultrafast
+    } else if (cores <= 2) {
         app.crf = 23; app.maxrate = 4000; app.bufsize = 8000; app.dynamicThreads = 1;
         app.pipeBufferSizeMB = 4; app.videoQueueSize = 512;
     } else if (cores <= 4) {
@@ -346,7 +420,6 @@ void UpdateLabelTransparent(HWND hwndParent, HWND hwndLabel, const std::string& 
     MapWindowPoints(HWND_DESKTOP, hwndParent, (LPPOINT)&rect, 2);
     InvalidateRect(hwndParent, &rect, FALSE);
     SetWindowTextA(hwndLabel, newText.c_str());
-    // UpdateWindow(hwndParent);
 }
 
 // ── UI helpers ────────────────────────────────────────────
@@ -365,6 +438,12 @@ std::string GetHotkeyName(UINT vk) {
     return "F10";
 }
 
+std::string GetCaptureMethodName() {
+    if (app.captureMethod == 0) return "GFX Capture (D3D11)";
+    if (app.captureMethod == 1) return "DDAGrab (DirectDraw)";
+    return "GDI Capture (55 FPS)";
+}
+
 void UpdateUI() {
     std::string hotkey = GetHotkeyName(app.recordHotkey);
     std::string pauseKey = GetHotkeyName(app.pauseHotkey);
@@ -378,7 +457,7 @@ void UpdateUI() {
         SendMessage(app.progressBar, PBM_SETPOS, app.convertProgress.load(), 0);
     } else if (app.recording && app.paused) {
         SetButton("RESUME (" + pauseKey + ")");
-        SetStatus("PAUSED\r\nGFX + MPEG-4 Capture -> x264 Post-Convert");
+        SetStatus("PAUSED\r\n" + GetCaptureMethodName() + " -> x264 Post-Convert");
         SendMessage(app.progressBar, PBM_SETMARQUEE, 0, 0);
     } else if (app.recording) {
         auto e = std::chrono::duration_cast<std::chrono::seconds>(
@@ -386,7 +465,7 @@ void UpdateUI() {
         SetButton("STOP (" + hotkey + ")");
         std::string status = "REC " + FormatTime((int)e);
         if (app.audioActive) status += "\r\n[AUDIO] Pipe Active";
-        status += "\r\nGFX + MPEG-4 Capture -> x264 Post-Convert";
+        status += "\r\n" + GetCaptureMethodName() + " -> x264 Post-Convert";
         SetStatus(status);
         SendMessage(app.progressBar, PBM_SETMARQUEE, 1, 0);
     } else {
@@ -397,7 +476,8 @@ void UpdateUI() {
         s += " | Threads: " + std::to_string(app.dynamicThreads);
         s += "\r\nTarget CRF: " + std::to_string(app.crf);
         s += "\r\n" + std::to_string(app.screenWidth) + "x" + std::to_string(app.screenHeight);
-        s += "\r\nGFX Capture -> x264 Pipeline | Live WASAPI Pipe";
+        s += "\r\n" + GetCaptureMethodName() + " -> x264 Pipeline";
+        s += "\r\nMax'sEngine(tm) Powered by FFmpeg";
         s += "\r\nBuilt by MaxRBLX1";
         if (app.sessions > 0) s += "\r\nSessions: " + std::to_string(app.sessions);
         SetStatus(s);
@@ -405,34 +485,27 @@ void UpdateUI() {
     }
 }
 
-// ── WASAPI Audio Capture (Microsoft event‑driven pattern) ──
+// ── WASAPI Audio Capture ──────────────────────────────────
 bool InitializeWASAPI() {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr) && hr != S_FALSE) return false;
-
     IMMDeviceEnumerator* enumerator = nullptr;
     IMMDevice* device = nullptr;
-
     hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
         __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
     if (FAILED(hr)) { CoUninitialize(); return false; }
-
     hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
     if (FAILED(hr)) { enumerator->Release(); CoUninitialize(); return false; }
-
     hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&app.audioClient);
     device->Release(); enumerator->Release();
     if (FAILED(hr)) { CoUninitialize(); return false; }
-
     hr = app.audioClient->GetMixFormat(&app.waveFormat);
     if (FAILED(hr)) { app.audioClient->Release(); app.audioClient = nullptr; CoUninitialize(); return false; }
-
     app.hAudioReadyEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (!app.hAudioReadyEvent) {
         app.audioClient->Release(); app.audioClient = nullptr;
         CoUninitialize(); return false;
     }
-
     hr = app.audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         0, 0, app.waveFormat, nullptr);
@@ -442,7 +515,6 @@ bool InitializeWASAPI() {
         CloseHandle(app.hAudioReadyEvent); app.hAudioReadyEvent = nullptr;
         CoUninitialize(); return false;
     }
-
     hr = app.audioClient->SetEventHandle(app.hAudioReadyEvent);
     if (FAILED(hr)) {
         CoTaskMemFree(app.waveFormat); app.waveFormat = nullptr;
@@ -450,7 +522,6 @@ bool InitializeWASAPI() {
         CloseHandle(app.hAudioReadyEvent); app.hAudioReadyEvent = nullptr;
         CoUninitialize(); return false;
     }
-
     hr = app.audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&app.captureClient);
     if (FAILED(hr)) {
         CoTaskMemFree(app.waveFormat); app.waveFormat = nullptr;
@@ -458,14 +529,12 @@ bool InitializeWASAPI() {
         CloseHandle(app.hAudioReadyEvent); app.hAudioReadyEvent = nullptr;
         CoUninitialize(); return false;
     }
-
     if (app.waveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
         WAVEFORMATEXTENSIBLE* ex = (WAVEFORMATEXTENSIBLE*)app.waveFormat;
         app.audioBitsPerSample = (ex->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? 32 : 16;
     } else if (app.waveFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
         app.audioBitsPerSample = 32;
     }
-
     app.audioClient->Start();
     app.audioActive = true;
     return true;
@@ -476,20 +545,16 @@ void AudioToPipeLoop() {
     HANDLE hAvrt = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
     UINT32 packetLength = 0;
     bool firstPacketSent = false;
-
     while (app.recording) {
         while (app.paused && app.recording) { Sleep(100); }
         if (!app.recording) break;
-
         DWORD waitResult = WaitForSingleObject(app.hAudioReadyEvent, 1000);
         if (waitResult != WAIT_OBJECT_0) {
             if (!app.recording) break;
             continue;
         }
-
         HRESULT hr = app.captureClient->GetNextPacketSize(&packetLength);
         if (FAILED(hr)) break;
-
         while (packetLength > 0) {
             BYTE* data; UINT32 frames; DWORD flags;
             UINT64 devicePosition = 0, qpcTimestamp = 0;
@@ -529,28 +594,34 @@ void CleanupWASAPI() {
     }
 }
 
-
-void SpawnWarmFFmpeg() {
-    // Capture 1 frame, encode with mpeg4, discard output, exit
-    // This fully initializes D3D11 + gfxcapture + encoder in the GPU driver cache
-    // The real FFmpeg on F10 will use the cached resources — instant start
+void SpawnWarmEngine() {
+    // Pre-initialize capture pipeline based on detected method
+    // Warms GPU driver cache for gfxcapture/ddagrab
+    GetCaptureInput(); // Sets app.captureMethod
     
-    std::string warmupCmd = 
-        "cmd.exe /c \"\"" + app.ffmpegPath + "\" -y -hide_banner -loglevel error "
-        "-f lavfi -i gfxcapture=monitor_idx=0 "
-        "-frames:v 1 -c:v mpeg4 -q:v 3 -f null NUL\"";
+    std::string warmupCmd;
+    if (app.captureMethod <= 1) {
+        // gfxcapture or ddagrab — warm the D3D11/DirectDraw pipeline
+        warmupCmd = 
+            "cmd.exe /c \"\"" + app.maxsenginePath + "\" -y -hide_banner -loglevel error "
+            + GetCaptureInput() + " "
+            "-frames:v 1 -c:v mpeg4 -q:v 3 -f null NUL\"";
+    } else {
+        // GDI — just verify the engine runs
+        warmupCmd = 
+            "cmd.exe /c \"\"" + app.maxsenginePath + "\" -y -hide_banner -loglevel error "
+            "-f gdigrab -framerate 1 -i desktop "
+            "-frames:v 1 -c:v mpeg4 -q:v 5 -f null NUL\"";
+    }
     
     STARTUPINFOA siWarm = { sizeof(siWarm) };
     siWarm.dwFlags = STARTF_USESHOWWINDOW;
     siWarm.wShowWindow = SW_HIDE;
-    
     PROCESS_INFORMATION piWarm = {0};
     std::vector<char> warmupCl(warmupCmd.begin(), warmupCmd.end());
     warmupCl.push_back('\0');
-    
     if (CreateProcessA(nullptr, warmupCl.data(), nullptr, nullptr, FALSE,
         CREATE_NO_WINDOW, nullptr, nullptr, &siWarm, &piWarm)) {
-        // Wait for it to finish (captures 1 frame, encodes, exits)
         WaitForSingleObject(piWarm.hProcess, 3000);
         CloseHandle(piWarm.hProcess);
         CloseHandle(piWarm.hThread);
@@ -567,7 +638,6 @@ void LoadCustomizations() {
             app.customBackground = GetExeDir() + "\\" + app.customBackground;
         }
     }
-    
     memset(buf, 0, sizeof(buf));
     GetPrivateProfileStringA("Appearance", "Font", "", buf, sizeof(buf), app.iniPath.c_str());
     if (strlen(buf) > 0) {
@@ -579,7 +649,6 @@ void LoadCustomizations() {
             AddFontResourceExA(app.customFont.c_str(), FR_PRIVATE, 0);
         }
     }
-    
     app.customFontSize = GetPrivateProfileIntA("Appearance", "FontSize", 14, app.iniPath.c_str());
     app.customColorRef = (COLORREF)GetPrivateProfileIntA("Appearance", "FontColor", 
         RGB(255, 255, 255), app.iniPath.c_str());
@@ -588,13 +657,9 @@ void LoadCustomizations() {
 void SaveCustomizations() {
     WritePrivateProfileStringA("Appearance", "Background", app.customBackground.c_str(), app.iniPath.c_str());
     WritePrivateProfileStringA("Appearance", "Font", app.customFont.c_str(), app.iniPath.c_str());
-    
-    char sizeBuf[16];
-    sprintf_s(sizeBuf, "%d", app.customFontSize);
+    char sizeBuf[16]; sprintf_s(sizeBuf, "%d", app.customFontSize);
     WritePrivateProfileStringA("Appearance", "FontSize", sizeBuf, app.iniPath.c_str());
-    
-    char colorBuf[16];
-    sprintf_s(colorBuf, "%d", (int)app.customColorRef);
+    char colorBuf[16]; sprintf_s(colorBuf, "%d", (int)app.customColorRef);
     WritePrivateProfileStringA("Appearance", "FontColor", colorBuf, app.iniPath.c_str());
 }
 
@@ -602,45 +667,32 @@ void ApplyBackground(HWND previewWnd, const std::string& path) {
     if (!FileExists(path)) return;
     Gdiplus::Image image(std::wstring(path.begin(), path.end()).c_str());
     if (image.GetLastStatus() != Gdiplus::Ok) return;
-    
-    RECT rect;
-    GetClientRect(previewWnd, &rect);
-    
+    RECT rect; GetClientRect(previewWnd, &rect);
     HDC hdc = GetDC(previewWnd);
     HDC memDC = CreateCompatibleDC(hdc);
     HBITMAP memBmp = CreateCompatibleBitmap(hdc, rect.right, rect.bottom);
     HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
-    
     Gdiplus::Graphics graphics(memDC);
     graphics.DrawImage(&image, 0, 0, rect.right, rect.bottom);
-    
     BitBlt(hdc, 0, 0, rect.right, rect.bottom, memDC, 0, 0, SRCCOPY);
-    
-    SelectObject(memDC, oldBmp);
-    DeleteObject(memBmp);
-    DeleteDC(memDC);
+    SelectObject(memDC, oldBmp); DeleteObject(memBmp); DeleteDC(memDC);
     ReleaseDC(previewWnd, hdc);
 }
 
 void ApplyFont(HWND previewWnd, const std::string& path, int size) {
     if (!FileExists(path)) return;
-    
     int result = AddFontResourceExA(path.c_str(), FR_PRIVATE, 0);
     if (result == 0) return;
-    
     std::string fileName = path;
     auto pos = fileName.find_last_of("\\/");
     if (pos != std::string::npos) fileName = fileName.substr(pos + 1);
-    
     std::string faceName;
     HDC hdc = GetDC(previewWnd);
-    LOGFONTA lf = {0};
-    lf.lfCharSet = DEFAULT_CHARSET;
+    LOGFONTA lf = {0}; lf.lfCharSet = DEFAULT_CHARSET;
     strncpy_s(lf.lfFaceName, sizeof(lf.lfFaceName), fileName.c_str(), _TRUNCATE);
     HFONT testFont = CreateFontA(size, 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        fileName.c_str());
+        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, fileName.c_str());
     if (testFont) {
         SelectObject(hdc, testFont);
         GetTextFaceA(hdc, LF_FACESIZE, lf.lfFaceName);
@@ -648,26 +700,18 @@ void ApplyFont(HWND previewWnd, const std::string& path, int size) {
         DeleteObject(testFont);
     }
     ReleaseDC(previewWnd, hdc);
-    
     if (faceName.empty()) {
         faceName = fileName;
         pos = faceName.find_last_of('.');
         if (pos != std::string::npos) faceName = faceName.substr(0, pos);
     }
-    
     HFONT hFont = CreateFontA(size, 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-        faceName.c_str());
-    
+        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
     if (hFont) {
-        // ---- FIX: delete the old font that was previously assigned ----
         HFONT hOldFont = (HFONT)SendMessage(previewWnd, WM_GETFONT, 0, 0);
         SendMessage(previewWnd, WM_SETFONT, (WPARAM)hFont, TRUE);
-        if (hOldFont && hOldFont != (HFONT)GetStockObject(DEFAULT_GUI_FONT)) {
-            DeleteObject(hOldFont);
-        }
-        // ----------------------------------------------------------------
+        if (hOldFont && hOldFont != (HFONT)GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(hOldFont);
         InvalidateRect(previewWnd, nullptr, TRUE);
     }
 }
@@ -676,68 +720,32 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     static HWND previewBg, previewFont, editFontSize;
     static std::string selectedBg, selectedFont;
     static int selectedFontSize;
-    
     switch (m) {
     case WM_CREATE: {
         selectedBg = app.customBackground;
         selectedFont = app.customFont;
         selectedFontSize = app.customFontSize;
-        
-        HWND lblBgHeader = CreateWindowA("STATIC", "Background", WS_VISIBLE | WS_CHILD | SS_LEFT,
-            15, 10, 280, 20, h, nullptr, nullptr, nullptr);
-        previewBg = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_BLACKRECT | SS_SUNKEN,
-            15, 35, 600, 180, h, (HMENU)ID_PREVIEW_BG, nullptr, nullptr);
-        HWND btnBrowseBg = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-            15, 225, 80, 22, h, (HMENU)ID_BTN_BROWSE_BG, nullptr, nullptr);
-        HWND btnResetBg = CreateWindowA("BUTTON", "Reset", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-            105, 225, 80, 22, h, (HMENU)ID_BTN_RESET_BG, nullptr, nullptr);
-        
-        HWND lblFontHeader = CreateWindowA("STATIC", "Font", WS_VISIBLE | WS_CHILD | SS_LEFT,
-            15, 260, 280, 20, h, nullptr, nullptr, nullptr);
-        previewFont = CreateWindowA("STATIC", "MaxRBLX1",
-            WS_VISIBLE | WS_CHILD | SS_CENTER | SS_SUNKEN,
-            15, 280, 600, 50, h, (HMENU)ID_PREVIEW_FONT, nullptr, nullptr);
-        HWND btnBrowseFont = CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-            15, 340, 80, 22, h, (HMENU)ID_BTN_BROWSE_FONT, nullptr, nullptr);
-        
-        HWND lblSize = CreateWindowA("STATIC", "Size:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
-            90, 342, 40, 20, h, nullptr, nullptr, nullptr);
-        editFontSize = CreateWindowA("EDIT", std::to_string(selectedFontSize).c_str(),
-            WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
-            135, 340, 45, 22, h, (HMENU)ID_EDIT_FONTSIZE, nullptr, nullptr);
-        
-        HWND lblColor = CreateWindowA("STATIC", "Color:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
-            180, 342, 50, 20, h, nullptr, nullptr, nullptr);
-        HWND btnColor = CreateWindowA("BUTTON", "Pick Color", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-            235, 340, 80, 22, h, (HMENU)ID_BTN_COLOR, nullptr, nullptr);
-        
-        HWND btnApply = CreateWindowA("BUTTON", "Apply", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-            200, 390, 80, 28, h, (HMENU)ID_BTN_APPLY, nullptr, nullptr);
-        HWND btnCancel = CreateWindowA("BUTTON", "Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-            300, 390, 80, 28, h, (HMENU)IDCANCEL, nullptr, nullptr);
-        
-        HFONT hGuiFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        SendMessage(lblBgHeader,  WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(btnBrowseBg,  WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(btnResetBg,   WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(lblFontHeader,WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(btnBrowseFont,WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(lblSize,      WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(editFontSize, WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(lblColor,     WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(btnColor,     WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(btnApply,     WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        SendMessage(btnCancel,    WM_SETFONT, (WPARAM)hGuiFont, TRUE);
-        
+        CreateWindowA("STATIC", "Background", WS_VISIBLE | WS_CHILD | SS_LEFT, 15, 10, 280, 20, h, nullptr, nullptr, nullptr);
+        previewBg = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_BLACKRECT | SS_SUNKEN, 15, 35, 600, 180, h, (HMENU)ID_PREVIEW_BG, nullptr, nullptr);
+        CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 15, 225, 80, 22, h, (HMENU)ID_BTN_BROWSE_BG, nullptr, nullptr);
+        CreateWindowA("BUTTON", "Reset", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 105, 225, 80, 22, h, (HMENU)ID_BTN_RESET_BG, nullptr, nullptr);
+        CreateWindowA("STATIC", "Font", WS_VISIBLE | WS_CHILD | SS_LEFT, 15, 260, 280, 20, h, nullptr, nullptr, nullptr);
+        previewFont = CreateWindowA("STATIC", "MaxRBLX1", WS_VISIBLE | WS_CHILD | SS_CENTER | SS_SUNKEN, 15, 280, 600, 50, h, (HMENU)ID_PREVIEW_FONT, nullptr, nullptr);
+        CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 15, 340, 80, 22, h, (HMENU)ID_BTN_BROWSE_FONT, nullptr, nullptr);
+        CreateWindowA("STATIC", "Size:", WS_VISIBLE | WS_CHILD | SS_RIGHT, 90, 342, 40, 20, h, nullptr, nullptr, nullptr);
+        editFontSize = CreateWindowA("EDIT", std::to_string(selectedFontSize).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER, 135, 340, 45, 22, h, (HMENU)ID_EDIT_FONTSIZE, nullptr, nullptr);
+        CreateWindowA("STATIC", "Color:", WS_VISIBLE | WS_CHILD | SS_RIGHT, 180, 342, 50, 20, h, nullptr, nullptr, nullptr);
+        CreateWindowA("BUTTON", "Pick Color", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 235, 340, 80, 22, h, (HMENU)ID_BTN_COLOR, nullptr, nullptr);
+        CreateWindowA("BUTTON", "Apply", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 200, 390, 80, 28, h, (HMENU)ID_BTN_APPLY, nullptr, nullptr);
+        CreateWindowA("BUTTON", "Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 300, 390, 80, 28, h, (HMENU)IDCANCEL, nullptr, nullptr);
         if (!selectedBg.empty()) ApplyBackground(previewBg, selectedBg);
         if (!selectedFont.empty()) ApplyFont(previewFont, selectedFont, selectedFontSize);
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
-        HDC hdcStatic = (HDC)w;
         if ((HWND)l == previewFont) {
-            SetTextColor(hdcStatic, app.customColorRef);
-            SetBkMode(hdcStatic, TRANSPARENT);
+            SetTextColor((HDC)w, app.customColorRef);
+            SetBkMode((HDC)w, TRANSPARENT);
             return (LRESULT)GetStockObject(NULL_BRUSH);
         }
         return DefWindowProcA(h, m, w, l);
@@ -748,23 +756,16 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             OPENFILENAMEA ofn = { sizeof(ofn) };
             ofn.hwndOwner = h;
             ofn.lpstrFilter = "Images (*.png;*.jpg;*.jpeg;*.bmp;*.gif)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All Files (*.*)\0*.*\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = sizeof(file);
+            ofn.lpstrFile = file; ofn.nMaxFile = sizeof(file);
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn)) {
-                selectedBg = file;
-                ApplyBackground(previewBg, selectedBg);
-            }
-        } else if (LOWORD(w) == ID_BTN_RESET_BG) {
-            selectedBg.clear();
-            InvalidateRect(previewBg, nullptr, TRUE);
-        } else if (LOWORD(w) == ID_BTN_BROWSE_FONT) {
+            if (GetOpenFileNameA(&ofn)) { selectedBg = file; ApplyBackground(previewBg, selectedBg); }
+        } else if (LOWORD(w) == ID_BTN_RESET_BG) { selectedBg.clear(); InvalidateRect(previewBg, nullptr, TRUE); }
+        else if (LOWORD(w) == ID_BTN_BROWSE_FONT) {
             char file[MAX_PATH] = {0};
             OPENFILENAMEA ofn = { sizeof(ofn) };
             ofn.hwndOwner = h;
             ofn.lpstrFilter = "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = sizeof(file);
+            ofn.lpstrFile = file; ofn.nMaxFile = sizeof(file);
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
             if (GetOpenFileNameA(&ofn)) {
                 selectedFont = file;
@@ -774,52 +775,33 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
                 pos = faceName.find_last_of('.');
                 if (pos != std::string::npos) faceName = faceName.substr(0, pos);
-
                 static HFONT hPreviewFontHandle = nullptr;
-                if (hPreviewFontHandle) {
-                    DeleteObject(hPreviewFontHandle);
-                }
-
+                if (hPreviewFontHandle) DeleteObject(hPreviewFontHandle);
                 hPreviewFontHandle = CreateFontA(selectedFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                    faceName.c_str());
-
-                if (hPreviewFontHandle) {
-                    SendMessage(previewFont, WM_SETFONT, (WPARAM)hPreviewFontHandle, TRUE);
-                }
+                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
+                if (hPreviewFontHandle) SendMessage(previewFont, WM_SETFONT, (WPARAM)hPreviewFontHandle, TRUE);
                 InvalidateRect(previewFont, nullptr, TRUE);
             }
         } else if (LOWORD(w) == ID_BTN_COLOR) {
             CHOOSECOLORA cc = { sizeof(cc) };
-            cc.hwndOwner = h;
-            cc.rgbResult = app.customColorRef;
+            cc.hwndOwner = h; cc.rgbResult = app.customColorRef;
             cc.Flags = CC_FULLOPEN | CC_RGBINIT;
-            static COLORREF acrCustClr[16] = {0};
-            cc.lpCustColors = acrCustClr;
-            if (ChooseColorA(&cc)) {
-                app.customColorRef = cc.rgbResult;
-                InvalidateRect(previewFont, nullptr, TRUE);
-            }
+            static COLORREF acrCustClr[16] = {0}; cc.lpCustColors = acrCustClr;
+            if (ChooseColorA(&cc)) { app.customColorRef = cc.rgbResult; InvalidateRect(previewFont, nullptr, TRUE); }
         } else if (LOWORD(w) == ID_BTN_APPLY) {
-            char sizeBuf[8];
-            GetWindowTextA(editFontSize, sizeBuf, sizeof(sizeBuf));
+            char sizeBuf[8]; GetWindowTextA(editFontSize, sizeBuf, sizeof(sizeBuf));
             int newSize = atoi(sizeBuf);
             if (newSize >= 8 && newSize <= 72) selectedFontSize = newSize;
-            
             app.customBackground = selectedBg;
             app.customFont = selectedFont;
             app.customFontSize = selectedFontSize;
             SaveCustomizations();
-            
-            char colorBuf[16];
-            sprintf_s(colorBuf, "%d", (int)app.customColorRef);
+            char colorBuf[16]; sprintf_s(colorBuf, "%d", (int)app.customColorRef);
             WritePrivateProfileStringA("Appearance", "FontColor", colorBuf, app.iniPath.c_str());
-            
             if (app.gifImage) { delete app.gifImage; app.gifImage = nullptr; }
             if (app.gifTimerId) { KillTimer(app.hwnd, app.gifTimerId); app.gifTimerId = 0; }
             app.backgroundIsGif = false;
-            
             if (!app.customBackground.empty()) {
                 std::string ext = app.customBackground;
                 auto dot = ext.find_last_of('.');
@@ -853,89 +835,95 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     }
                 }
             }
-            
             InvalidateRect(app.hwnd, nullptr, TRUE);
             UpdateWindow(app.hwnd);
             DestroyWindow(h);
-        } else if (LOWORD(w) == IDCANCEL) {
-            DestroyWindow(h);
-        }
+        } else if (LOWORD(w) == IDCANCEL) { DestroyWindow(h); }
         return 0;
     }
-    case WM_NCDESTROY: {
-        editFontSize = nullptr;
-        previewBg = nullptr;
-        previewFont = nullptr;
-        app.hSettingsWnd = nullptr;
-        return 0;
-    }
-    case WM_DESTROY:
-        app.hSettingsWnd = nullptr;
-        return 0;
+    case WM_NCDESTROY: editFontSize = nullptr; previewBg = nullptr; previewFont = nullptr; app.hSettingsWnd = nullptr; return 0;
+    case WM_DESTROY: app.hSettingsWnd = nullptr; return 0;
     }
     return DefWindowProcA(h, m, w, l);
 }
 
-// Per-monitor DPI scaling — works across mixed-DPI multi-monitor setups
 int ScaleXForWindow(HWND hwnd, int x) {
     UINT dpi = 96;
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
         typedef UINT(WINAPI* GetDpiForWindowProc)(HWND);
         auto pGetDpiForWindow = (GetDpiForWindowProc)GetProcAddress(hUser32, "GetDpiForWindow");
-        if (pGetDpiForWindow && hwnd) {
-            dpi = pGetDpiForWindow(hwnd);
-        }
+        if (pGetDpiForWindow && hwnd) dpi = pGetDpiForWindow(hwnd);
     }
     return MulDiv(x, dpi, 96);
 }
-
-int ScaleYForWindow(HWND hwnd, int y) {
-    return ScaleXForWindow(hwnd, y); // vertical scaling uses same DPI ratio
-}
+int ScaleYForWindow(HWND hwnd, int y) { return ScaleXForWindow(hwnd, y); }
 
 void OpenSettingsWindow() {
-    if (app.hSettingsWnd && IsWindow(app.hSettingsWnd)) {
-        SetForegroundWindow(app.hSettingsWnd);
-        return;
-    }
-    
+    if (app.hSettingsWnd && IsWindow(app.hSettingsWnd)) { SetForegroundWindow(app.hSettingsWnd); return; }
     WNDCLASSEXA wc = { sizeof(wc) };
-    wc.lpfnWndProc = SettingsWndProc;
-    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpfnWndProc = SettingsWndProc; wc.hInstance = GetModuleHandle(nullptr);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = "RetroRecSettings";
-    RegisterClassExA(&wc);
-    
+    wc.lpszClassName = "RetroRecSettings"; RegisterClassExA(&wc);
     int scaledW = ScaleXForWindow(app.hwnd, 640);
     int scaledH = ScaleYForWindow(app.hwnd, 480);
     app.hSettingsWnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
-        "RetroRecSettings", "⚙ Customization",
+        "RetroRecSettings", "Customization",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         (GetSystemMetrics(SM_CXSCREEN) - scaledW) / 2,
         (GetSystemMetrics(SM_CYSCREEN) - scaledH) / 2,
         scaledW, scaledH, app.hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
 }
 
-// ── Pause/Resume — Full NtSuspendProcess/NtResumeProcess ──
+// ── Build FFmpeg capture command ──────────────────────────
+std::string BuildCaptureCommand(const std::string& outputFile, bool hasAudio, HANDLE hAudioRead) {
+    std::ostringstream c;
+    c << "cmd.exe /c \""
+      << "\"" << app.maxsenginePath << "\" -y -hide_banner -loglevel error";
+    
+    // Buffer size varies by capture method
+    if (app.captureMethod == 2) {
+        c << " -rtbufsize 500M"; // GDI: smaller buffer
+    } else {
+        c << " -rtbufsize 2000M"; // gfx/dda: large buffer
+    }
+    
+    c << " -thread_queue_size " << app.videoQueueSize
+      << GetCaptureInput();
+    
+    if (hasAudio) {
+        c << " -thread_queue_size 512"
+          << " -f " << app.audioFormat << " -ar " << app.audioSampleRate 
+          << " -ac " << app.audioChannels << " -i pipe:0";
+    }
+    
+    c << " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
+      << GetCaptureFilter()
+      << " -c:v mpeg4 -q:v " << GetCaptureQuality()
+      << " -preset veryfast"
+      << " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
+    
+    if (hasAudio) c << " -c:a copy";
+    c << " -shortest -fflags +genpts"
+      << " -threads " << app.dynamicThreads
+      << " -f matroska \"" << outputFile << "\""
+      << "\"";
+    
+    return c.str();
+}
+
+// ── Pause/Resume ──────────────────────────────────────────
 void TogglePause() {
     if (!app.recording || app.converting) return;
-    
     app.paused = !app.paused;
-
     if (app.paused) {
-        // ── PAUSE ──
         app.pauseTime = std::chrono::steady_clock::now();
-        
-        // Stop audio thread
         app.recording = false;
         if (app.hAudioReadyEvent) SetEvent(app.hAudioReadyEvent);
         if (app.audioThread.joinable()) app.audioThread.join();
         if (app.hAudioPipeWrite) { CloseHandle(app.hAudioPipeWrite); app.hAudioPipeWrite = nullptr; }
         CleanupWASAPI();
-        
-        // Stop FFmpeg gracefully — finalizes current segment
         if (app.ffmpegProcess.hProcess) {
             SetConsoleCtrlHandler(nullptr, TRUE);
             GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, app.ffmpegProcess.dwProcessId);
@@ -947,56 +935,22 @@ void TogglePause() {
             app.ffmpegProcess.hProcess = nullptr;
             app.ffmpegProcess.hThread = nullptr;
         }
-        
-        app.recording = true;  // Still in recording session, just paused
+        app.recording = true;
         UpdateUI();
-        
     } else {
-        // ── RESUME ──
         auto now = std::chrono::steady_clock::now();
-        auto pauseDuration = std::chrono::duration_cast<std::chrono::milliseconds>(now - app.pauseTime);
-        app.totalPausedDuration += pauseDuration;
-        
-        // Create new segment filename
+        app.totalPausedDuration += std::chrono::duration_cast<std::chrono::milliseconds>(now - app.pauseTime);
         app.pauseSegmentCount++;
         std::string segFile = app.outputDir + "\\" + app.segmentBaseName + "_seg" + 
                               std::to_string(app.pauseSegmentCount) + "_temp.mkv";
         app.segmentFiles.push_back(segFile);
-        
-        // Re-initialize WASAPI
         bool wasapiReady = InitializeWASAPI();
         if (wasapiReady) {
             SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
             CreatePipe(&app.hAudioPipeRead, &app.hAudioPipeWrite, &sa, app.pipeBufferSizeMB * 1024 * 1024);
             SetHandleInformation(app.hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
         }
-        
-        std::string audioFormat = "s16le";
-        int sampleRate = 48000, channels = 2;
-        if (wasapiReady && app.waveFormat) {
-            audioFormat = (app.audioBitsPerSample == 32) ? "f32le" : "s16le";
-            sampleRate = app.waveFormat->nSamplesPerSec;
-            channels = app.waveFormat->nChannels;
-        }
-        
-        // Build FFmpeg command
-        std::ostringstream c;
-        c << "cmd.exe /c \""
-          << "\"" << app.ffmpegPath << "\" -y -hide_banner -loglevel error -rtbufsize 2000M"
-          << " -thread_queue_size " << app.videoQueueSize
-          << " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1";
-        if (wasapiReady) {
-            c << " -thread_queue_size 512"
-              << " -f " << audioFormat << " -ar " << sampleRate << " -ac " << channels << " -i pipe:0";
-        }
-        c << " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
-          << " -vf \"hwdownload,format=bgra,mpdecimate,format=yuv420p\""
-          << " -c:v mpeg4 -q:v 3 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
-        if (wasapiReady) c << " -c:a copy";
-        c << " -shortest -fflags +genpts -threads " << app.dynamicThreads
-          << " -f matroska \"" << segFile << "\""
-          << "\"";
-        
+        std::string cmdStr = BuildCaptureCommand(segFile, wasapiReady, app.hAudioPipeRead);
         STARTUPINFOA si = { sizeof(si) };
         si.dwFlags = STARTF_USESHOWWINDOW;
         if (wasapiReady && app.hAudioPipeRead != nullptr) {
@@ -1004,37 +958,29 @@ void TogglePause() {
             si.hStdInput = app.hAudioPipeRead;
         }
         si.wShowWindow = SW_HIDE;
-        
-        std::string cmdStr = c.str();
         std::vector<char> cl(cmdStr.begin(), cmdStr.end());
         cl.push_back('\0');
-        
-        // Start audio and FFmpeg at the EXACT SAME TIME — no drift
-        if (wasapiReady) {
-            app.audioThread = std::thread(AudioToPipeLoop);
-        }
-        
+        if (wasapiReady) app.audioThread = std::thread(AudioToPipeLoop);
         CreateProcessA(nullptr, cl.data(), nullptr, nullptr, TRUE,
             CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
             nullptr, nullptr, &si, &app.ffmpegProcess);
-        
         if (app.hAudioPipeRead) { CloseHandle(app.hAudioPipeRead); app.hAudioPipeRead = nullptr; }
-        
         UpdateUI();
     }
 }
 
-// ── Recording engine (audio‑first, stable) ────────────────
+// ── Recording engine ──────────────────────────────────────
 void StartRecording() {
     std::lock_guard<std::mutex> l(app.mtx);
     if (app.recording || app.converting) return;
-    if (app.ffmpegPath.empty() && !FindFFmpeg()) {
-        MessageBoxA(app.hwnd, "ffmpeg.exe not found!", "RetroRec", MB_OK);
+    if (app.maxsenginePath.empty() && !FindMaxsEngine()) {
+        MessageBoxA(app.hwnd, "maxsengine.exe not found!\n\nPlace maxsengine.exe (FFmpeg) next to RetroRec.exe\nPowered by FFmpeg — ffmpeg.org", "RetroRec", MB_OK);
         return;
     }
     ReloadIniIfChanged();
     DetectCurrentResolution();
     ConfigureUniversalPipeline();
+    GetCaptureInput(); // Detect capture method
 
     std::string ts = Timestamp();
     app.segmentBaseName = ts;
@@ -1042,8 +988,6 @@ void StartRecording() {
     app.segmentFiles.clear();
     app.totalPausedDuration = std::chrono::milliseconds(0);
     app.paused = false;
-    
-    // First segment
     app.tempFile = app.outputDir + "\\" + ts + "_seg0_temp.mkv";
     app.segmentFiles.push_back(app.tempFile);
     app.finalFile = app.outputDir + "\\" + ts + ".mkv";
@@ -1054,35 +998,17 @@ void StartRecording() {
         CreatePipe(&app.hAudioPipeRead, &app.hAudioPipeWrite, &sa, app.pipeBufferSizeMB * 1024 * 1024);
         SetHandleInformation(app.hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
     }
-    std::string audioFormat = "s16le";
-    int sampleRate = 48000, channels = 2;
+    
+    app.audioFormat = "s16le"; app.audioSampleRate = 48000; app.audioChannels = 2;
     if (wasapiReady && app.waveFormat) {
-        audioFormat = (app.audioBitsPerSample == 32) ? "f32le" : "s16le";
-        sampleRate = app.waveFormat->nSamplesPerSec;
-        channels = app.waveFormat->nChannels;
+        app.audioFormat = (app.audioBitsPerSample == 32) ? "f32le" : "s16le";
+        app.audioSampleRate = app.waveFormat->nSamplesPerSec;
+        app.audioChannels = app.waveFormat->nChannels;
     }
 
     app.recording = true;
-
-    // Build FFmpeg command FIRST
-    std::ostringstream c;
-    c << "cmd.exe /c \""
-      << "\"" << app.ffmpegPath << "\" -y -hide_banner -loglevel error -rtbufsize 2000M"
-      << " -thread_queue_size " << app.videoQueueSize
-      << " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1";
-    if (wasapiReady) {
-        c << " -thread_queue_size 512"
-          << " -f " << audioFormat << " -ar " << sampleRate << " -ac " << channels << " -i pipe:0";
-    }
-    c << " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
-      << " -vf \"hwdownload,format=bgra,mpdecimate,format=yuv420p\""
-      << " -c:v mpeg4 -q:v 3 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
-    if (wasapiReady) c << " -c:a copy";
-    c << " -shortest -fflags +genpts"
-      << " -threads " << app.dynamicThreads
-      << " -f matroska \"" << app.tempFile << "\""
-      << "\"";
-
+    std::string cmdStr = BuildCaptureCommand(app.tempFile, wasapiReady, app.hAudioPipeRead);
+    
     STARTUPINFOA si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW;
     if (wasapiReady && app.hAudioPipeRead != nullptr) {
@@ -1093,24 +1019,20 @@ void StartRecording() {
     }
     si.wShowWindow = SW_HIDE;
 
-    std::string cmdStr = c.str();
     std::vector<char> cl(cmdStr.begin(), cmdStr.end());
     cl.push_back('\0');
 
-    // Start audio and FFmpeg at the EXACT SAME TIME
-    if (wasapiReady) {
-        app.audioThread = std::thread(AudioToPipeLoop);
-    }
+    if (wasapiReady) app.audioThread = std::thread(AudioToPipeLoop);
 
     if (!CreateProcessA(nullptr, cl.data(), nullptr, nullptr, TRUE,
-        CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
+        CREATE_NEW_PROCESS_GROUP | ABOVE_NORMAL_PRIORITY_CLASS,
         nullptr, nullptr, &si, &app.ffmpegProcess)) {
         app.recording = false;
         if (wasapiReady) {
             if (app.audioThread.joinable()) app.audioThread.join();
             CleanupWASAPI();
         }
-        SetStatus("✗ Failed"); return;
+        SetStatus("Failed"); return;
     }
 
     if (app.hAudioPipeRead) { CloseHandle(app.hAudioPipeRead); app.hAudioPipeRead = nullptr; }
@@ -1124,19 +1046,14 @@ void StartRecording() {
 
 void StopRecording() {
     std::lock_guard<std::mutex> l(app.mtx);
-	if (!app.recording || app.paused) return;
-
+    if (!app.recording || app.paused) return;
     KillTimer(app.hwnd, ID_TIMER_UPDATE);
     SendMessage(app.progressBar, PBM_SETMARQUEE, 0, 0);
-    SetStatus("⏳ Finalizing...");
-
+    SetStatus("Finalizing...");
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - app.recStart).count();
     app.lastRecordingDurationMs = (int)elapsed;
-
     app.recording = false;
-
-    // If paused, audio/FFmpeg already stopped by TogglePause()
     if (app.paused) {
         app.paused = false;
     } else {
@@ -1144,7 +1061,6 @@ void StopRecording() {
         if (app.audioThread.joinable()) app.audioThread.join();
         if (app.hAudioPipeWrite) { CloseHandle(app.hAudioPipeWrite); app.hAudioPipeWrite = nullptr; }
         CleanupWASAPI();
-
         if (app.ffmpegProcess.hProcess) {
             SetConsoleCtrlHandler(nullptr, TRUE);
             GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, app.ffmpegProcess.dwProcessId);
@@ -1157,11 +1073,9 @@ void StopRecording() {
             app.ffmpegProcess.hThread = nullptr;
         }
     }
-
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
     Sleep(500);
 
-    // Build segments.txt
     std::string segmentsTxt = app.outputDir + "\\segments.txt";
     std::ofstream segFile(segmentsTxt);
     int validSegments = 0;
@@ -1173,66 +1087,58 @@ void StopRecording() {
     }
     segFile.close();
 
-    // No valid segments — nothing to convert
     if (validSegments == 0) {
         DeleteFileA(segmentsTxt.c_str());
-        SetStatus("✗ No recording data found");
+        SetStatus("No recording data found");
         UpdateUI();
         return;
     }
 
-    // ── CONVERSION BUILT INLINE ──
     if (app.convertAfterRecording) {
         app.converting = true;
-        SetStatus("⏳ Processing video...");
+        SetStatus("Processing video...");
         SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
-	
-        // Tell user the GUI will freeze during conversion
         MessageBoxA(app.hwnd, 
             "Conversion started!\n\n"
             "The RetroRec window will freeze during processing.\n"
             "This is normal — your recording is being compressed.\n\n"
             "Please wait...",
-            "RetroRec — Processing",
-            MB_OK | MB_ICONINFORMATION);
-
+            "RetroRec — Processing", MB_OK | MB_ICONINFORMATION);
         SYSTEM_INFO siCpu; GetSystemInfo(&siCpu);
         int threads = siCpu.dwNumberOfProcessors;
         if (threads < 2) threads = 2;
-
-        // Build conversion command
+        
+        // Use preset from config: ultrafast for ddagrab/GDI, veryfast for gfxcapture
+        const char* presetStr;
+        if (app.convertPreset == 0) presetStr = "ultrafast";
+        else if (app.convertPreset == 1) presetStr = "veryfast";
+        else presetStr = "medium";
+        
         char cmdLine[4096];
         sprintf_s(cmdLine, sizeof(cmdLine),
-            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" -fps_mode cfr -r 60 -c:v libx264 -preset veryfast -crf %d -c:a aac -b:a 128k -pix_fmt yuv420p -threads %d \"%s\"\"",
-            app.ffmpegPath.c_str(), segmentsTxt.c_str(), app.crf, threads, app.finalFile.c_str());
-
+            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" -fps_mode cfr -r 60 -c:v libx264 -preset %s -crf %d -c:a aac -b:a 128k -pix_fmt yuv420p -threads %d \"%s\"\"",
+            app.maxsenginePath.c_str(), segmentsTxt.c_str(), presetStr, app.crf, threads, app.finalFile.c_str());
         HANDLE hRead, hWrite;
         SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
         CreatePipe(&hRead, &hWrite, &sa, 0);
         SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-
         STARTUPINFOA siConv = { sizeof(siConv) };
         siConv.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
         siConv.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
         siConv.hStdOutput = hWrite;
         siConv.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
         siConv.wShowWindow = SW_HIDE;
-
         PROCESS_INFORMATION convertPI = {0};
         std::vector<char> cl(cmdLine, cmdLine + strlen(cmdLine) + 1);
-		
-		SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
-
+        SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
         if (CreateProcessA(nullptr, cl.data(), nullptr, nullptr, TRUE,
-            CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
+            CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS,
             nullptr, nullptr, &siConv, &convertPI)) {
-
             CloseHandle(hWrite);
             char buf[512];
             std::string lineBuffer;
             DWORD bytesRead;
             long long totalDurationUs = (long long)app.lastRecordingDurationMs * 1000;
-
             while (ReadFile(hRead, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
                 buf[bytesRead] = '\0';
                 lineBuffer += buf;
@@ -1248,7 +1154,7 @@ void StopRecording() {
                             if (percent > 100) percent = 100;
                             app.convertProgress = percent;
                             SendMessage(app.progressBar, PBM_SETPOS, percent, 0);
-                            SetStatus("⏳ Processing video... " + std::to_string(percent) + "%");
+                            SetStatus("Processing video... " + std::to_string(percent) + "%");
                         } catch (...) {}
                     }
                 }
@@ -1257,124 +1163,71 @@ void StopRecording() {
             WaitForSingleObject(convertPI.hProcess, INFINITE);
             CloseHandle(convertPI.hProcess);
             CloseHandle(convertPI.hThread);
-			
-			SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-
-            // Clean up
+            SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
             DeleteFileA(segmentsTxt.c_str());
-            for (const auto& seg : app.segmentFiles) {
-                if (FileExists(seg)) DeleteFileA(seg.c_str());
-            }
+            for (const auto& seg : app.segmentFiles) { if (FileExists(seg)) DeleteFileA(seg.c_str()); }
             app.segmentFiles.clear();
-
             app.converting = false;
             app.convertProgress = 0;
             SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
-
             long long fs = GetFileSize(app.finalFile);
             if (fs > 2048) {
                 app.totalBytes += fs;
-                SetStatus("✓ " + FormatSize(fs));
+                SetStatus(" " + FormatSize(fs));
                 ShellExecuteA(nullptr, "open", "explorer", ("/select,\"" + app.finalFile + "\"").c_str(), nullptr, SW_SHOWNORMAL);
-            } else {
-                SetStatus("✗ Conversion failed");
-            }
+            } else { SetStatus("Conversion failed"); }
             UpdateUI();
             return;
-        } else {
-            CloseHandle(hRead);
-            CloseHandle(hWrite);
-        }
+        } else { CloseHandle(hRead); CloseHandle(hWrite); }
     }
-
-    // Fallback: no conversion
-    app.converting = false;
-    app.convertProgress = 0;
+    app.converting = false; app.convertProgress = 0;
     SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
-    
     long long fs = GetFileSize(app.finalFile);
     if (fs > 2048) {
         app.totalBytes += fs;
-        SetStatus("✓ " + FormatSize(fs));
+        SetStatus(" " + FormatSize(fs));
         ShellExecuteA(nullptr, "open", "explorer", ("/select,\"" + app.finalFile + "\"").c_str(), nullptr, SW_SHOWNORMAL);
-    } else {
-        SetStatus("✗ File Error: Corrupted or Empty");
-    }
+    } else { SetStatus("File Error: Corrupted or Empty"); }
     UpdateUI();
 }
 
 // ── Window procedure ──────────────────────────────────────
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-	case WM_APP_REFRESH_FONTS: {
-    // Delayed font refresh — fixes GDI first-frame Unicode layout bug
-    // Triggered once after startup, after the window is fully painted
-    
-    if (!app.customFont.empty() && FileExists(app.customFont)) {
-        // Re-register the font to ensure it's in the system table
-        AddFontResourceExA(app.customFont.c_str(), FR_PRIVATE, 0);
-        
-        std::string faceName = app.customFont;
-        auto pos = faceName.find_last_of("\\/");
-        if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
-        pos = faceName.find_last_of('.');
-        if (pos != std::string::npos) faceName = faceName.substr(0, pos);
-        
-        // Create fresh font handle
-        HFONT hFreshFont = CreateFontA(app.customFontSize, 0, 0, 0, FW_NORMAL,
-            FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-            faceName.c_str());
-        
-        if (hFreshFont) {
-            // Apply to status label
-            if (app.lblStatus && IsWindow(app.lblStatus)) {
-                SendMessage(app.lblStatus, WM_SETFONT, (WPARAM)hFreshFont, TRUE);
+    case WM_APP_REFRESH_FONTS: {
+        if (!app.customFont.empty() && FileExists(app.customFont)) {
+            AddFontResourceExA(app.customFont.c_str(), FR_PRIVATE, 0);
+            std::string faceName = app.customFont;
+            auto pos = faceName.find_last_of("\\/");
+            if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+            pos = faceName.find_last_of('.');
+            if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+            HFONT hFreshFont = CreateFontA(app.customFontSize, 0, 0, 0, FW_NORMAL,
+                FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
+            if (hFreshFont) {
+                if (app.lblStatus && IsWindow(app.lblStatus)) SendMessage(app.lblStatus, WM_SETFONT, (WPARAM)hFreshFont, TRUE);
+                if (app.btnRecord && IsWindow(app.btnRecord)) SendMessage(app.btnRecord, WM_SETFONT, (WPARAM)hFreshFont, TRUE);
             }
-            // Apply to record button
-            if (app.btnRecord && IsWindow(app.btnRecord)) {
-                SendMessage(app.btnRecord, WM_SETFONT, (WPARAM)hFreshFont, TRUE);
-            }
-            // Note: hFreshFont is intentionally NOT deleted here.
-            // The controls now own it. GDI will clean up when the window destroys.
         }
-    }
-    
-    // Force a complete repaint of the entire window
-    InvalidateRect(h, nullptr, TRUE);
-    UpdateWindow(h);
-    
-    // Re-run UI update to ensure status text is current
-    UpdateUI();
-    
-    return 0;
-}
-    case WM_CREATE: {
-        std::string startLabel = "▶ START (" + GetHotkeyName(app.recordHotkey) + ")";
-        app.btnRecord = CreateWindowA("BUTTON", startLabel.c_str(),
-            WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-            20, 20, 340, 50, h, (HMENU)ID_BTN_RECORD, nullptr, nullptr);
-        CreateWindowA("BUTTON", "⚙", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-            360, 5, 30, 30, h, (HMENU)ID_BTN_SETTINGS, nullptr, nullptr);
-        app.lblStatus = CreateWindowA("STATIC", "",
-            WS_VISIBLE | WS_CHILD | SS_LEFT,
-            20, 120, 340, 130, h, nullptr, nullptr, nullptr);
-        app.progressBar = CreateWindowA("msctls_progress32", "",
-            WS_VISIBLE | WS_CHILD | PBS_MARQUEE,
-            20, 260, 340, 15, h, nullptr, nullptr, nullptr);
-        UINT recMod = GetHotkeyModifiers(app.recordHotkey);
-        RegisterHotKey(h, ID_HOTKEY_RECORD, recMod, app.recordHotkey);
-        UINT pauseMod = GetHotkeyModifiers(app.pauseHotkey);
-        RegisterHotKey(h, ID_HOTKEY_PAUSE, pauseMod, app.pauseHotkey);
-        SetTimer(h, ID_TIMER_INI_CHECK, 2000, nullptr);
-        
-        // Load customizations BEFORE updating UI so fonts are ready
-        LoadCustomizations();
-        
-        SetButton("▶ START (" + GetHotkeyName(app.recordHotkey) + ")");
+        InvalidateRect(h, nullptr, TRUE);
+        UpdateWindow(h);
         UpdateUI();
-        
-        // Load GIF if background is animated
+        return 0;
+    }
+    case WM_CREATE: {
+        std::string startLabel = "START (" + GetHotkeyName(app.recordHotkey) + ")";
+        app.btnRecord = CreateWindowA("BUTTON", startLabel.c_str(),
+            WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 20, 20, 340, 50, h, (HMENU)ID_BTN_RECORD, nullptr, nullptr);
+        CreateWindowA("BUTTON", "", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 360, 5, 30, 30, h, (HMENU)ID_BTN_SETTINGS, nullptr, nullptr);
+        app.lblStatus = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFT, 20, 120, 340, 130, h, nullptr, nullptr, nullptr);
+        app.progressBar = CreateWindowA("msctls_progress32", "", WS_VISIBLE | WS_CHILD | PBS_MARQUEE, 20, 260, 340, 15, h, nullptr, nullptr, nullptr);
+        UINT recMod = GetHotkeyModifiers(app.recordHotkey); RegisterHotKey(h, ID_HOTKEY_RECORD, recMod, app.recordHotkey);
+        UINT pauseMod = GetHotkeyModifiers(app.pauseHotkey); RegisterHotKey(h, ID_HOTKEY_PAUSE, pauseMod, app.pauseHotkey);
+        SetTimer(h, ID_TIMER_INI_CHECK, 2000, nullptr);
+        LoadCustomizations();
+        SetButton("START (" + GetHotkeyName(app.recordHotkey) + ")");
+        GetCaptureInput(); UpdateUI();
         if (!app.customBackground.empty() && FileExists(app.customBackground)) {
             std::string ext = app.customBackground;
             auto dot = ext.find_last_of('.');
@@ -1409,133 +1262,80 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
-    
-    // ─── NEW FIX 1: Auto-Send Window to Background when User Focuses Another App ───
     case WM_ACTIVATE: {
-        if (LOWORD(w) == WA_INACTIVE) {
-            // Drop RetroRec to the absolute bottom of the Z-order stack instead of making the user minimize it
-            SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
-        else {
-            // When brought back to focus, clean the window layers instantly to prevent stale frames
-            InvalidateRect(h, nullptr, TRUE);
-        }
+        if (LOWORD(w) == WA_INACTIVE) SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        else InvalidateRect(h, nullptr, TRUE);
         return 0;
     }
-
     case WM_CTLCOLORSTATIC: {
         HDC hdcStatic = (HDC)w;
-        
         static HFONT hCurrentFont = nullptr;
         static std::string lastFontName = "";
         static int lastFontSize = 0;
-
         if (!app.customFont.empty()) {
             if (app.customFont != lastFontName || app.customFontSize != lastFontSize) {
-                // 1. Unselect the old font before destroying it
-                if (hCurrentFont) {
-                    SelectObject(hdcStatic, (HFONT)GetStockObject(SYSTEM_FONT));
-                    DeleteObject(hCurrentFont);
-                    hCurrentFont = nullptr;
-                }
-
+                if (hCurrentFont) { SelectObject(hdcStatic, (HFONT)GetStockObject(SYSTEM_FONT)); DeleteObject(hCurrentFont); hCurrentFont = nullptr; }
                 std::string faceName = app.customFont;
-                auto pos = faceName.find_last_of("\\/");
-                if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
-                pos = faceName.find_last_of('.');
-                if (pos != std::string::npos) faceName = faceName.substr(0, pos);
-
+                auto pos = faceName.find_last_of("\\/"); if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+                pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos);
                 hCurrentFont = CreateFontA(app.customFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                    faceName.c_str());
-
-                lastFontName = app.customFont;
-                lastFontSize = app.customFontSize;
+                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
+                lastFontName = app.customFont; lastFontSize = app.customFontSize;
             }
-            
             if (hCurrentFont) SelectObject(hdcStatic, hCurrentFont);
         }
-
         SetBkMode(hdcStatic, TRANSPARENT);
         SetTextColor(hdcStatic, app.customColorRef);
         return (LRESULT)GetStockObject(NULL_BRUSH);
     }
     case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(h, &ps);
-        RECT rect;
-        GetClientRect(h, &rect);
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps);
+        RECT rect; GetClientRect(h, &rect);
         if (app.backgroundIsGif && app.gifImage) {
             Gdiplus::Graphics graphics(hdc);
             graphics.DrawImage(app.gifImage, 0, 0, rect.right, rect.bottom);
         } else if (!app.customBackground.empty() && FileExists(app.customBackground)) {
-            Gdiplus::Image image(std::wstring(app.customBackground.begin(),
-                app.customBackground.end()).c_str());
+            Gdiplus::Image image(std::wstring(app.customBackground.begin(), app.customBackground.end()).c_str());
             if (image.GetLastStatus() == Gdiplus::Ok) {
                 Gdiplus::Graphics graphics(hdc);
                 graphics.DrawImage(&image, 0, 0, rect.right, rect.bottom);
             }
         }
-        EndPaint(h, &ps);
-        return 0;
+        EndPaint(h, &ps); return 0;
     }
-    case WM_ERASEBKGND:
-        return 1;
+    case WM_ERASEBKGND: return 1;
     case WM_CTLCOLORBTN: {
         HDC hdcBtn = (HDC)w;
-        
         static HFONT hBtnFont = nullptr;
         static std::string lastBtnFontName = "";
         static int lastBtnFontSize = 0;
-
         if (!app.customFont.empty()) {
             if (app.customFont != lastBtnFontName || app.customFontSize != lastBtnFontSize) {
                 if (hBtnFont) DeleteObject(hBtnFont);
-
                 std::string faceName = app.customFont;
-                auto pos = faceName.find_last_of("\\/");
-                if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
-                pos = faceName.find_last_of('.');
-                if (pos != std::string::npos) faceName = faceName.substr(0, pos);
-
+                auto pos = faceName.find_last_of("\\/"); if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+                pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos);
                 hBtnFont = CreateFontA(app.customFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                    faceName.c_str());
-
-                lastBtnFontName = app.customFont;
-                lastBtnFontSize = app.customFontSize;
+                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
+                lastBtnFontName = app.customFont; lastBtnFontSize = app.customFontSize;
             }
             if (hBtnFont) SelectObject(hdcBtn, hBtnFont);
         }
         return 0;
     }
     case WM_COMMAND:
-        if (LOWORD(w) == ID_BTN_RECORD) {
-            if (app.recording) StopRecording(); else StartRecording();
-        } else if (LOWORD(w) == ID_BTN_SETTINGS) {
-            OpenSettingsWindow();
-            // ─── NEW FIX 2: Flush the entire window layer after user changes settings/clicks Apply ───
-            InvalidateRect(h, nullptr, TRUE);
-        }
+        if (LOWORD(w) == ID_BTN_RECORD) { if (app.recording) StopRecording(); else StartRecording(); }
+        else if (LOWORD(w) == ID_BTN_SETTINGS) { OpenSettingsWindow(); InvalidateRect(h, nullptr, TRUE); }
         return 0;
     case WM_HOTKEY:
-        if (w == ID_HOTKEY_RECORD) {
-            if (app.recording) StopRecording(); else StartRecording();
-        } else if (w == ID_HOTKEY_PAUSE) {
-            TogglePause();
-        }
+        if (w == ID_HOTKEY_RECORD) { if (app.recording) StopRecording(); else StartRecording(); }
+        else if (w == ID_HOTKEY_PAUSE) { TogglePause(); }
         return 0;
     case WM_TIMER:
-        if (w == ID_TIMER_UPDATE) {
-            if (!IsIconic(h)) UpdateUI();
-        }
-        else if (w == ID_TIMER_INI_CHECK) {
-            if (!IsIconic(h)) {
-                ReloadIniIfChanged();
-            }
-        }
+        if (w == ID_TIMER_UPDATE) { if (!IsIconic(h)) UpdateUI(); }
+        else if (w == ID_TIMER_INI_CHECK) { if (!IsIconic(h)) ReloadIniIfChanged(); }
         else if (w == 3001 && app.gifImage && app.gifFrameCount > 1) {
             if (!IsIconic(h)) {
                 app.gifCurrentFrame = (app.gifCurrentFrame + 1) % app.gifFrameCount;
@@ -1547,12 +1347,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_SYSCOMMAND: {
         UINT sysCmd = (w & 0xFFF0);
-        if (sysCmd == SC_MINIMIZE) {
-            if (app.gifTimerId) {
-                KillTimer(h, app.gifTimerId);
-                app.gifTimerId = 0;
-            }
-        }
+        if (sysCmd == SC_MINIMIZE) { if (app.gifTimerId) { KillTimer(h, app.gifTimerId); app.gifTimerId = 0; } }
         else if (sysCmd == SC_RESTORE) {
             if (app.backgroundIsGif && app.gifImage && app.gifFrameCount > 1 && !app.gifTimerId) {
                 UINT frameDelay = 100;
@@ -1561,10 +1356,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     Gdiplus::PropertyItem* prop = (Gdiplus::PropertyItem*)malloc(size);
                     if (prop && app.gifImage->GetPropertyItem(PropertyTagFrameDelay, size, prop) == Gdiplus::Ok) {
                         long* delays = (long*)prop->value;
-                        if (app.gifFrameCount > 0 && delays[0] > 0) {
-                            frameDelay = delays[0] * 10;
-                            if (frameDelay < 16) frameDelay = 16;
-                        }
+                        if (app.gifFrameCount > 0 && delays[0] > 0) { frameDelay = delays[0] * 10; if (frameDelay < 16) frameDelay = 16; }
                     }
                     free(prop);
                 }
@@ -1576,52 +1368,30 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CONVERSION_PROGRESS:
         app.convertProgress = (int)w;
-        SetStatus("⏳ Processing video... " + std::to_string((int)w) + "%");
+        SetStatus("Processing video... " + std::to_string((int)w) + "%");
         SendMessage(app.progressBar, PBM_SETPOS, w, 0);
-
-        // ─── NEW FIX 3: Clean out status bounds to wipe away previous text characters ───
-        {
-            RECT rc;
-            GetWindowRect(app.lblStatus, &rc);
-            MapWindowPoints(HWND_DESKTOP, h, (LPPOINT)&rc, 2);
-            InvalidateRect(h, &rc, TRUE); // Sweeps parent background over old status characters
-        }
+        { RECT rc; GetWindowRect(app.lblStatus, &rc); MapWindowPoints(HWND_DESKTOP, h, (LPPOINT)&rc, 2); InvalidateRect(h, &rc, TRUE); }
         return 0;
-        
     case WM_CONVERSION_DONE:
-        app.converting = false;
-        app.convertProgress = 0;
+        app.converting = false; app.convertProgress = 0;
         SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
         if (w == 1) {
             std::string* path = (std::string*)l;
             long long fs = GetFileSize(*path);
-            if (fs > 2048) {
-                app.totalBytes += fs;
-                SetStatus("✓ " + FormatSize(fs));
-                ShellExecuteA(nullptr, "open", "explorer", ("/select,\"" + *path + "\"").c_str(), nullptr, SW_SHOWNORMAL);
-            }
+            if (fs > 2048) { app.totalBytes += fs; SetStatus(" " + FormatSize(fs));
+                ShellExecuteA(nullptr, "open", "explorer", ("/select,\"" + *path + "\"").c_str(), nullptr, SW_SHOWNORMAL); }
             delete path;
-        } else {
-            SetStatus("✗ Conversion failed");
-        }
-        UpdateUI();
-
-        // ─── NEW FIX 4: Complete redraw execution to output final crisp string status ───
-        InvalidateRect(h, nullptr, TRUE);
+        } else SetStatus("Conversion failed");
+        UpdateUI(); InvalidateRect(h, nullptr, TRUE);
         return 0;
-        
     case WM_DESTROY:
         if (app.recording) StopRecording();
-        if (!app.tempFile.empty() && FileExists(app.tempFile) && !app.converting) {
-            DeleteFileA(app.tempFile.c_str());
-        }
+        if (!app.tempFile.empty() && FileExists(app.tempFile) && !app.converting) DeleteFileA(app.tempFile.c_str());
         if (app.gifImage) { delete app.gifImage; app.gifImage = nullptr; }
         if (app.gifTimerId) KillTimer(h, app.gifTimerId);
-        UnregisterHotKey(h, ID_HOTKEY_RECORD);
-        UnregisterHotKey(h, ID_HOTKEY_PAUSE);
+        UnregisterHotKey(h, ID_HOTKEY_RECORD); UnregisterHotKey(h, ID_HOTKEY_PAUSE);
         KillTimer(h, ID_TIMER_INI_CHECK);
-        PostQuitMessage(0);
-        return 0;
+        PostQuitMessage(0); return 0;
     }
     return DefWindowProcA(h, m, w, l);
 }
@@ -1629,53 +1399,45 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // ── Entry point ───────────────────────────────────────────
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     Gdiplus::GdiplusStartup(&app.gdiplusToken, &app.gdiplusInput, nullptr);
-    
     app.outputDir = GetVideosFolder();
     app.iniPath = GetExeDir() + "\\RetroRec.ini";
-
-    if (!FindFFmpeg()) {
-        MessageBoxA(nullptr, "Place ffmpeg.exe next to RetroRec.exe", "RetroRec", MB_OK);
+    if (!FindMaxsEngine()) {
+        MessageBoxA(nullptr, 
+            "maxsengine.exe not found!\n\n"
+            "Place maxsengine.exe (FFmpeg renamed) next to RetroRec.exe\n"
+            "or keep ffmpeg.exe for backward compatibility.\n\n"
+            "Max'sEngine(tm) Powered by FFmpeg — ffmpeg.org",
+            "RetroRec v" RETROREC_VERSION, MB_OK);
         Gdiplus::GdiplusShutdown(app.gdiplusToken);
         return 0;
     }
-
     CleanupOrphanedTempFiles();
-    if (!FileExists(app.iniPath)) CreateDefaultIni();
+    if (!FileExists(app.iniPath)) {
+        CreateDefaultIni();
+        // Flush Windows INI cache so LoadConfiguration reads real values
+        WritePrivateProfileStringA(nullptr, nullptr, nullptr, app.iniPath.c_str());
+    }
     LoadConfiguration();
     ConfigureUniversalPipeline();
-
-    // Spawn persistent warm FFmpeg at startup
-    SpawnWarmFFmpeg();
-    
+    SpawnWarmEngine();
     Sleep(500);
     PlayNotificationSound();
-
     WNDCLASSEXA wc = { sizeof(wc) };
     wc.lpfnWndProc = WndProc; wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr; 
-    wc.lpszClassName = "RetroRecWnd";
-    RegisterClassExA(&wc);
-
+    wc.lpszClassName = "RetroRecWnd"; RegisterClassExA(&wc);
     int w = 395, h = 340;
     app.hwnd = CreateWindowExA(WS_EX_TOPMOST | 0x02000000L, "RetroRecWnd",
-        "RetroRec v" RETROREC_VERSION,
+        "RetroRec v" RETROREC_VERSION " — Max'sEngine(tm)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         (GetSystemMetrics(SM_CXSCREEN) - w) / 2, (GetSystemMetrics(SM_CYSCREEN) - h) / 2,
         w, h, nullptr, nullptr, hInst, nullptr);
-    if (!app.hwnd) {
-        Gdiplus::GdiplusShutdown(app.gdiplusToken);
-        return 1;
-    }
-    
-    // Load customizations AFTER window and controls exist
+    if (!app.hwnd) { Gdiplus::GdiplusShutdown(app.gdiplusToken); return 1; }
     LoadCustomizations();
-
-    // Bind GIF background on startup
     if (app.gifImage) { delete app.gifImage; app.gifImage = nullptr; }
     if (app.gifTimerId) { KillTimer(app.hwnd, app.gifTimerId); app.gifTimerId = 0; }
     app.backgroundIsGif = false;
-    
     if (!app.customBackground.empty()) {
         std::string ext = app.customBackground;
         auto dot = ext.find_last_of('.');
@@ -1709,20 +1471,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
             }
         }
     }
-
     ShowWindow(app.hwnd, nCmdShow);
     UpdateWindow(app.hwnd);
-
-    // ─── GDI FIRST-FRAME FIX: Force refresh after window is fully realized ───
-    // The classic GDI subsystem lazily maps Unicode layout strings to child 
-    // controls. By posting a delayed refresh message, we force the text layer 
-    // to re-measure and re-draw after the initial paint cycle completes.
-    // No DirectWrite required. No MessageBox required. Just patience.
     PostMessage(app.hwnd, WM_APP_REFRESH_FONTS, 0, 0);
-
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-
     CleanupWASAPI();
     Gdiplus::GdiplusShutdown(app.gdiplusToken);
     return 0;
