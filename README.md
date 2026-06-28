@@ -18,6 +18,24 @@ No GPU? No problem. Old laptop? It works. PhantomRec is designed to run on **any
 
 ---
 
+### A Note on Windows 7
+
+PhantomRec runs on Windows 7 and delivers 60 FPS GDI capture. However, if you experience stutter or frame drops on Windows 7, this is a limitation of the operating system itself — not PhantomRec.
+
+**Windows 7 lacks the GPU-accelerated capture APIs** (D3D11 Desktop Duplication, DirectDraw) that make Windows 8+ recording truly smooth. GDI capture on Windows 7 is software-based and competes with your desktop for CPU time.
+
+**The fix is free:** Upgrade to Windows 8.1, 10, or 11 on the same hardware. You don't need a new PC — just a newer OS. Your existing CPU, RAM, and GPU will immediately benefit from hardware-accelerated capture.
+
+| Windows Version | Capture Method | Smoothness |
+|---|---|---|
+| Windows 7 | GDI (Software) | Good — limited by OS |
+| Windows 8/8.1 | DDAGrab (GPU) | Excellent |
+| Windows 10/11 | GFX Capture (GPU) | Perfect |
+
+**PhantomRec works on everything. Your OS determines how smooth it is.**
+
+---
+
 ## Why Choose PhantomRec?
 
 PhantomRec works differently from every other screen recorder. Instead of encoding everything in real time, it uses a **two-stage ghost pipeline**:
