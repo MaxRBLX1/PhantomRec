@@ -1,4 +1,4 @@
-// RetroRec v1.6 — Universal Ghost Screen Recorder
+// PhantomRec v1.8 — Universal Ghost Screen Recorder
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | GFX/DDAGrab/GDI Capture | x264 Post-Convert | WASAPI Audio | Zero Drops | Auto-CRF Matrix
@@ -24,13 +24,15 @@
 #include <avrt.h>
 #include <gdiplus.h>
 #include <algorithm>
+#include <powrprof.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "avrt.lib")
+#pragma comment(lib, "powrprof.lib")
 
-#define RETROREC_VERSION "1.7.0"
+#define PHANTOMREC_VERSION "1.8.0"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -50,7 +52,7 @@
 #define ID_BTN_COLOR 1010
 #define WM_APP_REFRESH_FONTS (WM_APP + 10)
 
-struct RetroRec {
+struct PhantomRec {
     bool convertAfterRecording = true;
     std::atomic<bool> recording{false};
     std::atomic<bool> paused{false};
@@ -121,6 +123,8 @@ struct RetroRec {
     LONG g_OriginalGameExStyle = 0;
     RECT g_OriginalGameRect = {0};
     bool g_GameStylesModified = false;
+	GUID originalPowerPlan;
+    bool powerPlanChanged = false;
 } app;
 
 // ── Function declarations ─────────────────────────────────
@@ -217,7 +221,7 @@ std::string GetCaptureInput() {
         return " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1";
     } else if (winVer >= 8) {
         app.captureMethod = 1;
-        return " -f lavfi -i ddagrab=0";
+        return " -f lavfi -i ddagrab=0:framerate=60";
     } else {
         app.captureMethod = 2;
         return " -f gdigrab -framerate 55 -i desktop";
@@ -227,13 +231,14 @@ std::string GetCaptureInput() {
 std::string GetCaptureFilter() {
     if (app.captureMethod == 0) {
         // gfxcapture: GPU zero-copy, hardware download
-        return " -vf \"hwdownload,format=bgra,mpdecimate,format=yuv420p\"";
+        return " -vf \"hwdownload,format=bgra,format=yuv420p\"";
     } else if (app.captureMethod == 1) {
         // ddagrab: DirectDraw, needs hwdownload
-        return " -vf \"hwdownload,format=bgra,mpdecimate,format=yuv420p\"";
+        return " -vf \"hwdownload,format=bgra,format=yuv420p\"";
     } else {
-        // GDI: CPU-based, aggressive mpdecimate
-        return " -vf \"mpdecimate=hi=64:lo=64:frac=0.33,format=yuv420p\"";
+        // GDI: NO FILTERS. mpdecimate causes stutter.
+        // Raw frames straight to mpeg4 — ultrafast preset keeps the pipe clear.
+        return "";
     }
 }
 
@@ -267,7 +272,7 @@ bool IsGameSafeForWindowMod(HWND hWnd) {
 void ForceExclusiveTaskbarRender(HWND hGameWnd) {
     if (!hGameWnd || !IsWindow(hGameWnd)) return;
 
-    // Skip RetroRec's own window
+    // Skip PhantomRec's own window
     if (hGameWnd == app.hwnd) return;
 
     bool canModify = IsGameSafeForWindowMod(hGameWnd);
@@ -380,13 +385,13 @@ std::string Timestamp() {
     time_t n = time(nullptr); tm t;
     localtime_s(&t, &n);
     char b[64]; strftime(b, sizeof(b), "%Y%m%d_%H%M%S", &t);
-    return "RetroRec_" + std::string(b);
+    return "PhantomRec_" + std::string(b);
 }
 
 std::string GetVideosFolder() {
     char p[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_MYVIDEO, nullptr, 0, p))) {
-        std::string d = std::string(p) + "\\RetroRec";
+        std::string d = std::string(p) + "\\PhantomRec";
         CreateDirectoryA(d.c_str(), nullptr);
         return d;
     }
@@ -394,7 +399,7 @@ std::string GetVideosFolder() {
 }
 
 bool FindMaxsEngine() {
-    // Only look in the same folder as RetroRec.exe
+    // Only look in the same folder as PhantomRec.exe
     // No system PATH search — avoids false positives
     
     std::string local = GetExeDir() + "\\maxsengine.exe";
@@ -413,7 +418,7 @@ void PlayNotificationSound() {
 void CreateDefaultIni() {
     std::ofstream ini(app.iniPath);
     ini << "; ========================================\r\n"
-        << "; RetroRec v1.7 Configuration\r\n"
+        << "; PhantomRec v1.8 Configuration\r\n"
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
@@ -1008,11 +1013,11 @@ void OpenSettingsWindow() {
     wc.lpfnWndProc = SettingsWndProc; wc.hInstance = GetModuleHandle(nullptr);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = "RetroRecSettings"; RegisterClassExA(&wc);
+    wc.lpszClassName = "PhantomRecSettings"; RegisterClassExA(&wc);
     int scaledW = ScaleXForWindow(app.hwnd, 640);
     int scaledH = ScaleYForWindow(app.hwnd, 480);
     app.hSettingsWnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
-        "RetroRecSettings", "Customization",
+        "PhantomRecSettings", "Customization",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         (GetSystemMetrics(SM_CXSCREEN) - scaledW) / 2,
         (GetSystemMetrics(SM_CYSCREEN) - scaledH) / 2,
@@ -1041,11 +1046,22 @@ std::string BuildCaptureCommand(const std::string& outputFile, bool hasAudio, HA
           << " -ac " << app.audioChannels << " -i pipe:0";
     }
     
+    // Get the filter string (empty for GDI)
+    std::string filterStr = GetCaptureFilter();
+    
     c << " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
-      << GetCaptureFilter()
-      << " -c:v mpeg4 -q:v " << GetCaptureQuality()
-      << " -preset veryfast"
-      << " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
+      << filterStr
+      << " -c:v mpeg4 -q:v " << GetCaptureQuality();
+    
+    // GFX: veryfast (GPU zero-copy handles the heavy lifting)
+    // DDAGrab + GDI: ultrafast (CPU-bound, need fastest encode)
+    if (app.captureMethod == 0) {
+        c << " -preset veryfast";
+    } else {
+        c << " -preset ultrafast";
+    }
+    
+    c << " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv";
     
     if (hasAudio) c << " -c:a copy";
     c << " -shortest -fflags +genpts"
@@ -1115,9 +1131,19 @@ void TogglePause() {
 // ── Recording engine ──────────────────────────────────────
 void StartRecording() {
     std::lock_guard<std::mutex> l(app.mtx);
+    if (!app.powerPlanChanged) {
+        GUID highPerf = {0x8c5e7fda, 0xe8bf, 0x4a96, {0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c}};
+        GUID* pOriginalGuid = nullptr;
+        if (PowerGetActiveScheme(nullptr, &pOriginalGuid) == ERROR_SUCCESS) {
+            app.originalPowerPlan = *pOriginalGuid;
+            LocalFree(pOriginalGuid);
+            PowerSetActiveScheme(nullptr, &highPerf);
+            app.powerPlanChanged = true;
+        }
+    }
     if (app.recording || app.converting) return;
     if (app.maxsenginePath.empty() && !FindMaxsEngine()) {
-        MessageBoxA(app.hwnd, "maxsengine.exe not found!\n\nPlace maxsengine.exe (FFmpeg) next to RetroRec.exe\nPowered by FFmpeg — ffmpeg.org", "RetroRec", MB_OK);
+        MessageBoxA(app.hwnd, "maxsengine.exe not found!\n\nPlace maxsengine.exe (FFmpeg) next to PhantomRec.exe\nPowered by FFmpeg — ffmpeg.org", "PhantomRec", MB_OK);
         return;
     }
     ReloadIniIfChanged();
@@ -1197,7 +1223,12 @@ void StopRecording() {
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - app.recStart).count();
     app.lastRecordingDurationMs = (int)elapsed;
+	if (app.lastRecordingDurationMs < 1000) app.lastRecordingDurationMs = 1000;
     app.recording = false;
+    if (app.powerPlanChanged) {
+        PowerSetActiveScheme(nullptr, &app.originalPowerPlan);
+        app.powerPlanChanged = false;
+    }
     if (app.g_SelectedGameWnd) {
         RestoreGameWindow(app.g_SelectedGameWnd);
 		app.g_SelectedGameWnd = nullptr;
@@ -1222,7 +1253,7 @@ void StopRecording() {
         }
     }
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-    Sleep(500);
+    Sleep(1500);
 
     std::string segmentsTxt = app.outputDir + "\\segments.txt";
     std::ofstream segFile(segmentsTxt);
@@ -1242,16 +1273,16 @@ void StopRecording() {
         return;
     }
 
-    if (app.convertAfterRecording) {
+    if (app.convertAfterRecording && app.lastRecordingDurationMs >= 1000) {
         app.converting = true;
         SetStatus("Processing video...");
         SendMessage(app.progressBar, PBM_SETPOS, 0, 0);
         MessageBoxA(app.hwnd, 
             "Conversion started!\n\n"
-            "The RetroRec window will freeze during processing.\n"
+            "The PhantomRec window will freeze during processing.\n"
             "This is normal — your recording is being compressed.\n\n"
             "Please wait...",
-            "RetroRec — Processing", MB_OK | MB_ICONINFORMATION);
+            "PhantomRec — Processing", MB_OK | MB_ICONINFORMATION);
         SYSTEM_INFO siCpu; GetSystemInfo(&siCpu);
         int threads = siCpu.dwNumberOfProcessors;
         if (threads < 2) threads = 2;
@@ -1548,14 +1579,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     Gdiplus::GdiplusStartup(&app.gdiplusToken, &app.gdiplusInput, nullptr);
     app.outputDir = GetVideosFolder();
-    app.iniPath = GetExeDir() + "\\RetroRec.ini";
+    app.iniPath = GetExeDir() + "\\PhantomRec.ini";
     if (!FindMaxsEngine()) {
         MessageBoxA(nullptr, 
             "maxsengine.exe not found!\n\n"
-            "Place maxsengine.exe (FFmpeg renamed) next to RetroRec.exe\n"
+            "Place maxsengine.exe (FFmpeg renamed) next to PhantomRec.exe\n"
             "or keep ffmpeg.exe for backward compatibility.\n\n"
             "Max'sEngine(tm) Powered by FFmpeg — ffmpeg.org",
-            "RetroRec v" RETROREC_VERSION, MB_OK);
+            "PhantomRec v" PHANTOMREC_VERSION, MB_OK);
         Gdiplus::GdiplusShutdown(app.gdiplusToken);
         return 0;
     }
@@ -1574,10 +1605,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpfnWndProc = WndProc; wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr; 
-    wc.lpszClassName = "RetroRecWnd"; RegisterClassExA(&wc);
+    wc.lpszClassName = "PhantomRecWnd"; RegisterClassExA(&wc);
     int w = 395, h = 340;
-    app.hwnd = CreateWindowExA(WS_EX_TOPMOST | 0x02000000L, "RetroRecWnd",
-        "RetroRec v" RETROREC_VERSION " — Max'sEngine(tm)",
+    app.hwnd = CreateWindowExA(WS_EX_TOPMOST | 0x02000000L, "PhantomRecWnd",
+        "PhantomRec v" PHANTOMREC_VERSION " — Max'sEngine(tm)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         (GetSystemMetrics(SM_CXSCREEN) - w) / 2, (GetSystemMetrics(SM_CYSCREEN) - h) / 2,
         w, h, nullptr, nullptr, hInst, nullptr);
