@@ -23,13 +23,14 @@
 #include <commctrl.h>
 #include <avrt.h>
 #include <gdiplus.h>
+#include <algorithm>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "avrt.lib")
 
-#define RETROREC_VERSION "1.6.0"
+#define RETROREC_VERSION "1.7.0"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -115,6 +116,11 @@ struct RetroRec {
     std::string audioFormat = "s16le";       // ADD THIS
     int audioSampleRate = 48000;             // ADD THIS
     int audioChannels = 2; 
+    HWND g_SelectedGameWnd = nullptr;
+    LONG g_OriginalGameStyle = 0;
+    LONG g_OriginalGameExStyle = 0;
+    RECT g_OriginalGameRect = {0};
+    bool g_GameStylesModified = false;
 } app;
 
 // ── Function declarations ─────────────────────────────────
@@ -138,10 +144,10 @@ void ApplyFont(HWND previewWnd, const std::string& path, int size);
 std::string GetCaptureInput();
 std::string GetCaptureFilter();
 int GetCaptureQuality();
+void ForceExclusiveTaskbarRender(HWND hGameWnd);
+void RestoreGameWindow(HWND hGameWnd);
 
-// ── Reliable Windows version detection ────────────────────
 int GetWindowsVersion() {
-    // Returns: 10 = Win10/11, 8 = Win8/8.1, 7 = Win7, 0 = unknown
     static int cached = -1;
     if (cached >= 0) return cached;
     
@@ -163,11 +169,51 @@ int GetWindowsVersion() {
     return cached;
 }
 
-// ── Capture method helpers (UPDATED) ──────────────────────
+void AutoDetectGameWindow() {
+    if (app.g_SelectedGameWnd && IsWindow(app.g_SelectedGameWnd)) return;
+    
+    HWND hForeground = GetForegroundWindow();
+    if (!hForeground || hForeground == app.hwnd) return;
+    
+    char className[256];
+    GetClassNameA(hForeground, className, sizeof(className));
+    if (strcmp(className, "Shell_TrayWnd") == 0) return;
+    if (strcmp(className, "Progman") == 0) return;
+    if (strcmp(className, "WorkerW") == 0) return;
+    
+    app.g_SelectedGameWnd = hForeground;
+}
+
+// ── Reliable Windows version detection ────────────────────
 std::string GetCaptureInput() {
     int winVer = GetWindowsVersion();
     if (winVer >= 10) {
         app.captureMethod = 0;
+        
+        // ALWAYS deploy taskbar anchor first — keeps DWM alive
+        // even if game is already in exclusive fullscreen
+        HWND hTaskbar = FindWindowA("Shell_TrayWnd", nullptr);
+        if (hTaskbar) {
+            SetWindowPos(hTaskbar, HWND_BOTTOM, 0, 0, 0, 0, 
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        
+        if (app.g_SelectedGameWnd && IsWindow(app.g_SelectedGameWnd)) {
+            ForceExclusiveTaskbarRender(app.g_SelectedGameWnd);
+            
+            DWORD_PTR result = 0;
+            LRESULT isResponding = SendMessageTimeoutA(
+                app.g_SelectedGameWnd, WM_NULL, 0, 0, 
+                SMTO_ABORTIFHUNG | SMTO_NORMAL, 50, &result
+            );
+            
+            if (isResponding == 0) {
+                return " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1";
+            } else {
+                return " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1";
+            }
+        }
+        
         return " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1";
     } else if (winVer >= 8) {
         app.captureMethod = 1;
@@ -189,6 +235,103 @@ std::string GetCaptureFilter() {
         // GDI: CPU-based, aggressive mpdecimate
         return " -vf \"mpdecimate=hi=64:lo=64:frac=0.33,format=yuv420p\"";
     }
+}
+
+bool IsGameSafeForWindowMod(HWND hWnd) {
+    if (!hWnd) return false;
+    
+    DWORD pid;
+    GetWindowThreadProcessId(hWnd, &pid);
+    
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) return false;
+    
+    char procName[MAX_PATH];
+    DWORD len = MAX_PATH;
+    bool isSafe = true;
+    
+    if (QueryFullProcessImageNameA(hProcess, 0, procName, &len)) {
+        std::string name(procName);
+        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+        
+        // Games with fragile OpenGL/Cocos2d engines that crash on window mods
+        if (name.find("geometrydash") != std::string::npos) isSafe = false;
+        if (name.find("geometry dash") != std::string::npos) isSafe = false;
+        // Add more sensitive games here as they're discovered
+    }
+    
+    CloseHandle(hProcess);
+    return isSafe;
+}
+
+void ForceExclusiveTaskbarRender(HWND hGameWnd) {
+    if (!hGameWnd || !IsWindow(hGameWnd)) return;
+
+    // Skip RetroRec's own window
+    if (hGameWnd == app.hwnd) return;
+
+    bool canModify = IsGameSafeForWindowMod(hGameWnd);
+    int scrWidth = GetSystemMetrics(SM_CXSCREEN);
+    int scrHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    if (canModify) {
+        // Save original styles for restoration
+        app.g_OriginalGameStyle = GetWindowLongA(hGameWnd, GWL_STYLE);
+        app.g_OriginalGameExStyle = GetWindowLongA(hGameWnd, GWL_EXSTYLE);
+        GetWindowRect(hGameWnd, &app.g_OriginalGameRect);
+        app.g_GameStylesModified = true;
+
+        // Strip decorative borders
+        LONG newStyle = app.g_OriginalGameStyle & 
+            ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+        SetWindowLongA(hGameWnd, GWL_STYLE, newStyle);
+
+        // Force game to fill screen as topmost layer
+        SetWindowPos(hGameWnd, HWND_TOPMOST, 0, 0, scrWidth, scrHeight, 
+                     SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+
+    // ALWAYS deploy the taskbar anchor — this is the Xbox Game Bar loophole
+    // The taskbar keeps DWM awake, gfxcapture keeps reading frames
+    // Works even when we can't touch the game window (Geometry Dash, etc.)
+    HWND hTaskbar = FindWindowA("Shell_TrayWnd", nullptr);
+    if (hTaskbar) {
+        SetWindowPos(hTaskbar, HWND_BOTTOM, 0, 0, 0, 0, 
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+void RestoreGameWindow(HWND hGameWnd) {
+    // Only restore if we actually modified the window
+    if (!app.g_GameStylesModified || !hGameWnd || !IsWindow(hGameWnd)) {
+        // Still restore taskbar to normal
+        HWND hTaskbar = FindWindowA("Shell_TrayWnd", nullptr);
+        if (hTaskbar) {
+            SetWindowPos(hTaskbar, HWND_TOP, 0, 0, 0, 0, 
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        return;
+    }
+    
+    // Restore original window styles
+    SetWindowLongA(hGameWnd, GWL_STYLE, app.g_OriginalGameStyle);
+    SetWindowLongA(hGameWnd, GWL_EXSTYLE, app.g_OriginalGameExStyle);
+    
+    // Restore original size and position
+    int w = app.g_OriginalGameRect.right - app.g_OriginalGameRect.left;
+    int h = app.g_OriginalGameRect.bottom - app.g_OriginalGameRect.top;
+    SetWindowPos(hGameWnd, HWND_NOTOPMOST, 
+        app.g_OriginalGameRect.left, app.g_OriginalGameRect.top, w, h,
+        SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    
+    // Restore taskbar to normal position
+    HWND hTaskbar = FindWindowA("Shell_TrayWnd", nullptr);
+    if (hTaskbar) {
+        SetWindowPos(hTaskbar, HWND_TOP, 0, 0, 0, 0, 
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    
+    app.g_GameStylesModified = false;
 }
 
 int GetCaptureQuality() {
@@ -270,7 +413,7 @@ void PlayNotificationSound() {
 void CreateDefaultIni() {
     std::ofstream ini(app.iniPath);
     ini << "; ========================================\r\n"
-        << "; RetroRec v1.6 Configuration\r\n"
+        << "; RetroRec v1.7 Configuration\r\n"
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
@@ -288,7 +431,7 @@ void CreateDefaultIni() {
         << "Hotkey=F10\r\n"
         << "PauseHotkey=P\r\n"
         << "ConvertAfterRecording=yes\r\n"
-        << "ConvertPreset=medium\r\n";  // ← medium default
+        << "ConvertPreset=veryfast\r\n";
     ini.close();
 }
 
@@ -980,7 +1123,8 @@ void StartRecording() {
     ReloadIniIfChanged();
     DetectCurrentResolution();
     ConfigureUniversalPipeline();
-    GetCaptureInput(); // Detect capture method
+    AutoDetectGameWindow();  // ← Must run before GetCaptureInput
+    GetCaptureInput();
 
     std::string ts = Timestamp();
     app.segmentBaseName = ts;
@@ -1054,6 +1198,10 @@ void StopRecording() {
         std::chrono::steady_clock::now() - app.recStart).count();
     app.lastRecordingDurationMs = (int)elapsed;
     app.recording = false;
+    if (app.g_SelectedGameWnd) {
+        RestoreGameWindow(app.g_SelectedGameWnd);
+		app.g_SelectedGameWnd = nullptr;
+    }
     if (app.paused) {
         app.paused = false;
     } else {
