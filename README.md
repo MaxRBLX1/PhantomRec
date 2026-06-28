@@ -1,3 +1,9 @@
+## Project History
+
+PhantomRec was originally released as **RetroRec** (v1.0 through v1.7). The name was changed in v1.8 to better reflect the software's modern capabilities and universal appeal. All recordings and settings from previous versions are fully compatible with PhantomRec.
+
+---
+
 # PhantomRec — "Record now. Encode later. Zero lag."
 
 **Built by MaxRBLX1**
@@ -121,11 +127,6 @@ g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 \
     -ladvapi32 -lole32 -luuid -lksuser -lavrt -lgdiplus -lcomdlg32
 ⚠️ Important: The -D_WIN32_WINNT=0x0A00 flag is strictly required. Without it, the binary targets Windows XP compatibility, causing the recording pipeline to fail with 0 FPS.
 ```
-
-## Project History
-
-PhantomRec was originally released as **RetroRec** (v1.0 through v1.7). The name was changed in v1.8 to better reflect the software's modern capabilities and universal appeal. All recordings and settings from previous versions are fully compatible with PhantomRec.
-
 ---
 
 ## License & Credits
