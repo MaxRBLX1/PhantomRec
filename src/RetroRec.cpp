@@ -224,7 +224,7 @@ std::string GetCaptureInput() {
         return " -f lavfi -i ddagrab=0:framerate=60";
     } else {
         app.captureMethod = 2;
-        return " -f gdigrab -framerate 55 -i desktop";
+        return " -f gdigrab -framerate 60 -i desktop";
     }
 }
 
@@ -236,9 +236,7 @@ std::string GetCaptureFilter() {
         // ddagrab: DirectDraw, needs hwdownload
         return " -vf \"hwdownload,format=bgra,format=yuv420p\"";
     } else {
-        // GDI: NO FILTERS. mpdecimate causes stutter.
-        // Raw frames straight to mpeg4 — ultrafast preset keeps the pipe clear.
-        return "";
+        return " -vf \"format=bgra,format=yuv420p\"";
     }
 }
 
