@@ -1,4 +1,4 @@
-# PhantomRec v1.7 — "Record now. Encode later. Zero lag."
+# PhantomRec — "Record now. Encode later. Zero lag."
 
 **Built by MaxRBLX1**
 
@@ -124,7 +124,7 @@ g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 \
 
 ## Project History
 
-PhantomRec was originally released as **RetroRec** (v1.0 through v1.6). The name was changed in v1.7 to better reflect the software's modern capabilities and universal appeal. All recordings and settings from previous versions are fully compatible with PhantomRec.
+PhantomRec was originally released as **RetroRec** (v1.0 through v1.7). The name was changed in v1.8 to better reflect the software's modern capabilities and universal appeal. All recordings and settings from previous versions are fully compatible with PhantomRec.
 
 ---
 
