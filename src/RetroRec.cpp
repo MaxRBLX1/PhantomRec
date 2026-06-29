@@ -1,4 +1,4 @@
-// PhantomRec v1.8 — Universal Ghost Screen Recorder
+// PhantomRec v1.9 — Universal Ghost Screen Recorder
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | GFX/DDAGrab/GDI Capture | x264 Post-Convert | WASAPI Audio | Zero Drops | Auto-CRF Matrix
@@ -32,7 +32,7 @@
 #pragma comment(lib, "avrt.lib")
 #pragma comment(lib, "powrprof.lib")
 
-#define PHANTOMREC_VERSION "1.8.0"
+#define PHANTOMREC_VERSION "1.9.0"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -416,7 +416,7 @@ void PlayNotificationSound() {
 void CreateDefaultIni() {
     std::ofstream ini(app.iniPath);
     ini << "; ========================================\r\n"
-        << "; PhantomRec v1.8 Configuration\r\n"
+        << "; PhantomRec v1.9 Configuration\r\n"
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
@@ -561,11 +561,19 @@ void ConfigureUniversalPipeline() {
 }
 
 void UpdateLabelTransparent(HWND hwndParent, HWND hwndLabel, const std::string& newText) {
+    // Set the new text first
+    SetWindowTextA(hwndLabel, newText.c_str());
+    
+    // Get the label's rectangle in parent coordinates
     RECT rect;
     GetWindowRect(hwndLabel, &rect);
     MapWindowPoints(HWND_DESKTOP, hwndParent, (LPPOINT)&rect, 2);
-    InvalidateRect(hwndParent, &rect, FALSE);
-    SetWindowTextA(hwndLabel, newText.c_str());
+    
+    // Force a complete repaint of the label area
+    // This is the key: InvalidateRect with TRUE for bErase
+    // combined with UpdateWindow ensures the old text is cleared
+    InvalidateRect(hwndParent, &rect, TRUE);
+    UpdateWindow(hwndParent);
 }
 
 // ── UI helpers ────────────────────────────────────────────
@@ -574,6 +582,7 @@ void SetStatus(const std::string& t) {
         UpdateLabelTransparent(app.hwnd, app.lblStatus, t);
     }
 }
+
 void SetButton(const std::string& t) {
     if (app.btnRecord && IsWindow(app.btnRecord)) SetWindowTextA(app.btnRecord, t.c_str());
 }
@@ -603,17 +612,10 @@ void UpdateUI() {
         SendMessage(app.progressBar, PBM_SETPOS, app.convertProgress.load(), 0);
     } else if (app.recording && app.paused) {
         SetButton("RESUME (" + pauseKey + ")");
-        SetStatus("PAUSED\r\n" + GetCaptureMethodName() + " -> x264 Post-Convert");
-        SendMessage(app.progressBar, PBM_SETMARQUEE, 0, 0);
+        SetStatus("PAUSED");
     } else if (app.recording) {
-        auto e = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - app.recStart).count();
         SetButton("STOP (" + hotkey + ")");
-        std::string status = "REC " + FormatTime((int)e);
-        if (app.audioActive) status += "\r\n[AUDIO] Pipe Active";
-        status += "\r\n" + GetCaptureMethodName() + " -> x264 Post-Convert";
-        SetStatus(status);
-        SendMessage(app.progressBar, PBM_SETMARQUEE, 1, 0);
+        SetStatus("Recording...");
     } else {
         SetButton("START (" + hotkey + ")");
         std::string s = "Ready - " + hotkey + " to record\r\n";
@@ -889,9 +891,10 @@ LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CTLCOLORSTATIC: {
+        HDC hdcStatic = (HDC)w;
         if ((HWND)l == previewFont) {
-            SetTextColor((HDC)w, app.customColorRef);
-            SetBkMode((HDC)w, TRANSPARENT);
+            SetTextColor(hdcStatic, app.customColorRef);
+            SetBkMode(hdcStatic, TRANSPARENT);
             return (LRESULT)GetStockObject(NULL_BRUSH);
         }
         return DefWindowProcA(h, m, w, l);
@@ -1469,6 +1472,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps);
         RECT rect; GetClientRect(h, &rect);
+        
         if (app.backgroundIsGif && app.gifImage) {
             Gdiplus::Graphics graphics(hdc);
             graphics.DrawImage(app.gifImage, 0, 0, rect.right, rect.bottom);
@@ -1478,7 +1482,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 Gdiplus::Graphics graphics(hdc);
                 graphics.DrawImage(&image, 0, 0, rect.right, rect.bottom);
             }
+        } else {
+            // No background — fill with black so old text doesn't stack
+            HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(hdc, &rect, hBrush);
+            DeleteObject(hBrush);
         }
+        
         EndPaint(h, &ps); return 0;
     }
     case WM_ERASEBKGND: return 1;
