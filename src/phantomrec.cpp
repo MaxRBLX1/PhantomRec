@@ -1,4 +1,4 @@
-// PhantomRec.cpp — PhantomRec v1.9.5 C++ UI
+// PhantomRec.cpp — PhantomRec C++ UI
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | Pure C Core + C++ UI
