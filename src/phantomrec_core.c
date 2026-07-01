@@ -1,4 +1,4 @@
-// phantomrec_core.c — PhantomRec v1.9.5 Pure C Core
+// phantomrec_core.c — PhantomRec Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | GFX/DDAGrab/GDI Capture | x264 Post-Convert | WASAPI Audio
