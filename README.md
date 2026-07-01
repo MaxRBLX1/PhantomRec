@@ -1,12 +1,13 @@
-## Project History
-
-PhantomRec was originally released as **RetroRec** (v1.0 through v1.7). The name was changed in v1.8 to better reflect the software's modern capabilities and universal appeal. All recordings and settings from previous versions are fully compatible with PhantomRec.
-
----
-
 # PhantomRec — "Record now. Encode later. Zero lag."
 
 **Built by MaxRBLX1**
+**v1.9.5**
+
+---
+
+## Project History
+
+PhantomRec was originally released as **RetroRec** (v1.0 through v1.7). The name was changed in v1.8. All recordings and settings from previous versions are fully compatible.
 
 ---
 
@@ -18,27 +19,25 @@ No GPU? No problem. Old laptop? It works. PhantomRec is designed to run on **any
 
 ---
 
-### A Note on Windows 7
+### A Note on Windows Versions
 
-PhantomRec runs on Windows 7 and delivers 60 FPS GDI capture. However, if you experience stutter or frame drops on Windows 7, this is a limitation of the operating system itself — not PhantomRec.
+PhantomRec doesn't care what hardware you have. It cares what OS you run — because your OS determines what capture APIs are available.
 
-**Windows 7 lacks the GPU-accelerated capture APIs** (D3D11 Desktop Duplication, DirectDraw) that make Windows 8+ recording truly smooth. GDI capture on Windows 7 is software-based and competes with your desktop for CPU time.
+| Windows Version | Capture Method | Recording FPS | Playback FPS |
+|---|---|---|---|
+| Windows 10 / 11 | GFX (GPU zero-copy) | 60 VFR | 60 |
+| Windows 8 / 8.1 | DDAGrab (GPU) | 60 VFR | 60 |
+| Windows 7 / Vista | GDI (CPU software) | 55 cap | 30 |
 
-**The fix is free:** Upgrade to Windows 8.1, 10, or 11 on the same hardware. You don't need a new PC — just a newer OS. Your existing CPU, RAM, and GPU will immediately benefit from hardware-accelerated capture.
+Windows 7/Vista lack GPU-accelerated capture APIs. PhantomRec still works — but your OS caps playback at 30 FPS.
 
-| Windows Version | Capture Method | Smoothness |
-|---|---|---|
-| Windows 7 | GDI (Software) | Good — limited by OS |
-| Windows 8/8.1 | DDAGrab (GPU) | Excellent |
-| Windows 10/11 | GFX Capture (GPU) | Perfect |
-
-**PhantomRec works on everything. Your OS determines how smooth it is.**
+**The fix is free:** Upgrade to Windows 8.1, 10, or 11 on the same hardware. Your CPU, RAM, and GPU haven't changed — but now the capture APIs exist, and PhantomRec uses them.
 
 ---
 
 ## Why Choose PhantomRec?
 
-PhantomRec works differently from every other screen recorder. Instead of encoding everything in real time, it uses a **two-stage ghost pipeline**:
+PhantomRec uses a **two-stage ghost pipeline** — the same architecture that made Fraps legendary, rebuilt for modern codecs.
 
 **Stage 1 — Live Capture (mpeg4, 1 thread, ~5% CPU):**
 The screen is captured and encoded with MPEG‑4 Part 2 — a lightweight codec that barely touches your CPU. Duplicate frames are skipped automatically. No GPU encoding means no stop-button freeze.
@@ -47,13 +46,12 @@ The screen is captured and encoded with MPEG‑4 Part 2 — a lightweight codec 
 When you press stop, PhantomRec converts the recording to x264 at high quality using all CPU cores — when your system is idle. You get NVENC-quality file sizes without needing a GPU.
 
 ### The Result:
-
 - Your GPU stays 100% dedicated to your game or desktop
 - Recording uses ~5% CPU on any hardware
 - Heavy compression happens when you're done recording
-- **Instant stop** — no encoder queue drain freeze like GPU encoders
-- Smooth 60 FPS output on any CPU from 2008 onward
-- **No GPU required.** No GPU encoding used. No NVENC. No AMF. CPU only.
+- **Instant stop** — no encoder queue drain freeze
+- Smooth output on any CPU from 2008 onward
+- **No GPU required. No NVENC. No AMF. CPU only.**
 
 ---
 
@@ -61,8 +59,8 @@ When you press stop, PhantomRec converts the recording to x264 at high quality u
 
 | Component | Minimum |
 |---|---|
-| **Operating System** | Windows 7 SP1 / Server 2008 R2 or later |
-| **CPU** | Any dual-core x86_64 processor (SSE2) |
+| **OS** | Windows Vista / 7 / 8 / 8.1 / 10 / 11 |
+| **CPU** | Any dual-core x86_64 (SSE2) |
 | **RAM** | 4 GB |
 | **GPU** | Any. Integrated. None. All work. |
 | **Storage** | Any HDD or SSD |
@@ -73,46 +71,84 @@ When you press stop, PhantomRec converts the recording to x264 at high quality u
 
 ## Quick Start
 
-1. Download `PhantomRec_v1.7.0.zip` and extract all files to a folder.
+1. Download the latest release and extract all files.
 2. Make sure `maxsengine.exe` is in the same folder as `PhantomRec.exe`.
-3. Double-click **`PhantomRec.exe`** — a small always-on-top window appears.
-4. Press **F10** to start recording.
-5. Press **F10** again to stop.
-6. Wait a few seconds for post-processing — your video opens automatically in Explorer.
+3. Double-click `PhantomRec.exe` — a small always-on-top window appears.
+4. Press **F10** to start recording. Press **F10** again to stop.
+5. Wait a few seconds for post-processing — your video opens automatically.
 
 ---
 
-## What's New in v1.7
+## What's New in v1.9.5
 
-- **Exclusive Fullscreen Capture** — Games in exclusive fullscreen mode are now captured correctly. PhantomRec keeps the DWM alive so `gfxcapture` never loses the signal.
-- **Auto Game Detection** — Press F10 and PhantomRec automatically finds the game you're playing. No manual window selection needed.
-- **Safe Window Handling** — Fragile game engines (Geometry Dash, older OpenGL titles) are automatically detected and protected from window modification.
-- **Taskbar Anchor** — Uses the same DWM loophole as Xbox Game Bar to capture exclusive fullscreen games with zero performance loss.
+- **Pure C Core** — Capture engine rewritten in C11. No STL. No exceptions. Zero allocations during recording.
+- **C++ UI** — Clean separation. Win32 + GDI+. Core and UI linked through `extern "C"`.
+- **Smart Capture Fallback** — GFX → DDAGrab → GDI. Every method degrades gracefully if the OS doesn't support it.
+- **Customization** — Custom backgrounds (PNG, JPG, BMP, GIF), custom fonts (TTF/OTF), font size, font color.
+- **Animated GIF Backgrounds** — Smooth frame transitions, no ghosting.
+- **INI Hot-Reload** — Edit `PhantomRec.ini` while running. Changes apply within 2 seconds.
+- **No UI Stacking** — Text and backgrounds render clean on every update.
 
 ---
 
 ## Configuration
 
-All settings are stored in `PhantomRec.ini` next to the executable. You can edit it while PhantomRec is running — changes take effect within 2 seconds, no restart needed.
+All settings in `PhantomRec.ini`. Edit while running — no restart needed.
 
 ```ini
 [Settings]
 Hotkey=F10
 PauseHotkey=P
 ConvertAfterRecording=yes
-ConvertPreset=medium
-ConvertPreset options: medium (default, best quality), veryfast (balanced), ultrafast (fastest for older machines).
+ConvertPreset=veryfast
+CaptureMethod=auto
 ```
 
-## Capture Methods
+**CaptureMethod options:** `auto` (default), `gfx`, `ddagrab`, `gdi`
+**ConvertPreset options:** `medium` (best quality), `veryfast` (balanced), `ultrafast` (fastest)
 
-PhantomRec automatically selects the best capture method for your Windows version:
+```ini
+[Appearance]
+Background=C:\path\to\image.png
+Font=C:\path\to\font.ttf
+FontSize=14
+FontColor=16777215
+```
 
-| Windows Version | Capture Method | Details |
-|---|---|---|
-| Windows 10 / 11 | `gfxcapture` (D3D11) | GPU zero-copy, cursor visible, 60 FPS VFR |
-| Windows 8 / 8.1 | `ddagrab` (DirectDraw) | GPU DirectDraw, 60 FPS VFR |
-| Windows 7 / Vista | `gdigrab` (GDI) | CPU software, 55 FPS cap |
+## Building from Source
+
+### Requirements
+- MinGW-w64 (UCRT64)
+- Windows SDK
+
+### Compile
+
+```bash
+# Step 1: Compile the pure C core
+gcc -std=c11 -O2 -c src/phantomrec_core.c -o phantomrec_core.o
+
+# Step 2: Link with C++ UI
+g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 \
+    phantomrec_core.o src/PhantomRec.cpp \
+    -o PhantomRec.exe \
+    -lcomctl32 -lshell32 -luser32 -lgdi32 -lkernel32 \
+    -ladvapi32 -lole32 -luuid -lksuser -lavrt -lgdiplus -lcomdlg32
+```
+
+⚠️ **`-D_WIN32_WINNT=0x0A00` is strictly required.** Without it, the binary targets XP compatibility and the recording pipeline fails with 0 FPS.
+
+---
+
+## Project Tree
+
+| | |
+|---|---|
+| `PhantomRec/` | |
+| `├── src/` | |
+| `│   ├── PhantomRec.cpp` | C++ UI (Win32 + GDI+) |
+| `│   ├── phantomrec_core.c` | Pure C core |
+| `│   └── phantomrec_core.h` | Shared header (extern "C" bridge) |
+And remaining or licence and Readme and .gitgnore
 
 ---
 
@@ -122,34 +158,14 @@ PhantomRec automatically selects the best capture method for your Windows versio
 - **Webcam overlay** — Not supported.
 - **Per-window capture** — PhantomRec captures the entire monitor.
 
-## Building from Source
-
-### Requirements
-
-- GCC (MinGW-w64 UCRT64)
-- Windows SDK
-- GDI+ and COMCTL32 development headers
-
-### Linker Libraries
-comctl32.lib, shell32.lib, user32.lib, gdi32.lib, kernel32.lib,
-advapi32.lib, ole32.lib, uuid.lib, ksuser.lib, avrt.lib,
-gdiplus.lib, comdlg32.lib
-
-### Compile Command
-
-```bash
-g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 \
-    -finput-charset=UTF-8 -fexec-charset=UTF-8 \
-    -o PhantomRec.exe src/PhantomRec.cpp \
-    -lcomctl32 -lshell32 -luser32 -lgdi32 -lkernel32 \
-    -ladvapi32 -lole32 -luuid -lksuser -lavrt -lgdiplus -lcomdlg32
-⚠️ Important: The -D_WIN32_WINNT=0x0A00 flag is strictly required. Without it, the binary targets Windows XP compatibility, causing the recording pipeline to fail with 0 FPS.
-```
 ---
 
 ## License & Credits
 
-- PhantomRec is free software. Use it, modify it, and share it.
-- Built by **MaxRBLX1**.
-- **Max'sEngine™** powered by **FFmpeg** ([ffmpeg.org](https://ffmpeg.org)).
-- Audio capture based on Microsoft WASAPI sample code.
+PhantomRec is free software. Use it, modify it, share it.
+
+Built by **MaxRBLX1**.
+
+**Max'sEngine™** powered by **FFmpeg** ([ffmpeg.org](https://ffmpeg.org)).
+
+Audio capture based on Microsoft WASAPI sample code.
