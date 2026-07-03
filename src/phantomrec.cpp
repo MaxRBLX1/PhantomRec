@@ -1,4 +1,4 @@
-// PhantomRec.cpp — PhantomRec C++ UI
+// PhantomRec.cpp — PhantomRec v1.9.5 C++ UI
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | Pure C Core + C++ UI
@@ -11,6 +11,7 @@
 #include <commctrl.h>
 #include <gdiplus.h>
 #include <fstream>
+#include <powrprof.h>
 
 using std::min;
 
@@ -18,6 +19,7 @@ using std::min;
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "powrprof.lib")
 
 extern "C" {
 #include "phantomrec_core.h"
@@ -187,26 +189,35 @@ static std::string GetHotkeyName(UINT vk) {
     return "F10";
 }
 
-// ============================================================================
-// INI / Configuration
-// ============================================================================
 static void CreateDefaultIni() {
     std::ofstream ini(g_iniPath);
     ini << "; ========================================\r\n"
-        << "; PhantomRec v1.9.5 Configuration\r\n"
+        << "; PhantomRec v1.9.5 Settings\r\n"
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
+        << "; Stage 1: Ut Video Lossless (CPU-friendly)\r\n"
+        << "; Stage 2: x264 Post-Convert (after recording)\r\n"
+        << ";\r\n"
         << "; CaptureMethod: How PhantomRec captures your screen\r\n"
-        << ";   auto    = PhantomRec picks the best method for your system\r\n"
-        << ";   ddagrab = GPU capture, 60 FPS, best for games and desktop\r\n"
-        << ";   gfx     = GPU capture, window-specific, for modern apps\r\n"
-        << ";   gdi     = CPU capture, works on any Windows version\r\n"
+        << ";   auto    = PhantomRec picks the best method for your OS\r\n"
+        << ";   ddagrab = DXGI Desktop Duplication (GPU, 60 FPS, Win8+)\r\n"
+        << ";   gfx     = D3D11 Graphics Capture (GPU, 60 FPS, Win10+)\r\n"
+        << ";   gdi     = CPU software capture (55 FPS, any Windows)\r\n"
+        << ";\r\n"
         << "; Hotkey: F1-F12 for function keys\r\n"
-        << ";         A-Z for Ctrl+Letter hotkeys\r\n"
+        << ";         A-Z for Ctrl+Letter hotkeys (e.g., R = Ctrl+R)\r\n"
+        << ";\r\n"
         << "; PauseHotkey: Same format as Hotkey\r\n"
+        << ";\r\n"
         << "; ConvertAfterRecording: yes or no\r\n"
-        << "; ConvertPreset: ultrafast, veryfast, or medium\r\n"
+        << ";   yes = Automatically compress after recording (recommended)\r\n"
+        << ";   no  = Keep the lossless temp file (very large)\r\n"
+        << ";\r\n"
+        << "; ConvertPreset: x264 compression speed/quality\r\n"
+        << ";   ultrafast = Fastest compression, larger file\r\n"
+        << ";   veryfast  = Balanced (recommended)\r\n"
+        << ";   medium    = Best compression, slower\r\n"
         << "; ========================================\r\n\r\n"
         << "[Settings]\r\n"
         << "Hotkey=F10\r\n"
@@ -723,6 +734,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         UnregisterHotKey(h, ID_HOTKEY_RECORD);
         UnregisterHotKey(h, ID_HOTKEY_PAUSE);
         KillTimer(h, ID_TIMER_INI_CHECK);
+        if (g_Core.powerPlanChanged) {
+            PowerSetActiveScheme(NULL, &g_Core.originalPowerPlan);
+            g_Core.powerPlanChanged = 0;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -736,8 +751,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     Gdiplus::GdiplusStartupInput gdiplusInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
     
+    // LOCK HIGH PERFORMANCE AT LAUNCH — game-agnostic, 0ms latency
+    {
+        GUID highPerf = {0x8c5e7fda, 0xe8bf, 0x4a96, {0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c}};
+        GUID* pOriginalGuid = NULL;
+        if (PowerGetActiveScheme(NULL, &pOriginalGuid) == ERROR_SUCCESS) {
+            g_Core.originalPowerPlan = *pOriginalGuid;
+            LocalFree(pOriginalGuid);
+            PowerSetActiveScheme(NULL, &highPerf);
+            g_Core.powerPlanChanged = 1;
+        }
+    }
+    
     g_outputDir = GetVideosFolder();
-    g_iniPath = GetExeDir() + "\\PhantomRec.ini";
+    g_iniPath = GetExeDir() + "\\Settings.ini";
     
     // Initialize core
     Core_Init(&g_Core, nullptr, g_outputDir.c_str());
