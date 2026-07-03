@@ -1,7 +1,7 @@
-// phantomrec_core.c — PhantomRec Pure C Core
+// phantomrec_core.c — PhantomRec v1.9.5 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// Max'sEngine™ | GFX/DDAGrab/GDI Capture | x264 Post-Convert | WASAPI Audio
+// Max'sEngine™ | DXGI/GFX/DDAGrab/GDI Capture | Ut Video Stage 1 | x264 Stage 2 | WASAPI Audio
 //
 // Compile as part of PhantomRec.exe (link with C++ UI):
 //   gcc -std=c11 -O2 -c phantomrec_core.c -o phantomrec_core.o
@@ -74,8 +74,8 @@ void Core_SetCaptureMethodEx(PhantomRecCore* core, CaptureMethod method) {
 
 const char* Core_GetCaptureMethodDesc(const PhantomRecCore* core) {
     switch (core->captureMethod) {
-    case 0: return "DDAGrab (GPU, 60 FPS, borderless)";
-    case 1: return "DDAGrab (GPU, 60 FPS, borderless)";
+    case 0: return "GFX Capture (D3D11, GPU, 60 FPS)";
+    case 1: return "DDAGrab (DXGI, GPU, 60 FPS)";
     case 2: return "GDI (CPU, 55 FPS, software)";
     default: return "Unknown";
     }
@@ -364,8 +364,6 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     GetCaptureInput(core, captureInput, sizeof(captureInput));
     GetCaptureFilter(core, captureFilter, sizeof(captureFilter));
     
-    int quality = GetCaptureQuality(core);
-    const char* preset = (core->captureMethod == 0) ? "veryfast" : "ultrafast";
     const char* rtbufsize = (core->captureMethod == 2) ? "500M" : "2000M";
     
     int offset = sprintf_s(cmdLine, cmdSize,
@@ -384,9 +382,9 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     offset += sprintf_s(cmdLine + offset, cmdSize - offset,
         " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
         "%s"
-        " -c:v mpeg4 -q:v %d -preset %s"
+        " -c:v utvideo -pred left -pix_fmt yuv420p"
         " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
-        captureFilter, quality, preset);
+        captureFilter);
     
     if (hasAudio) {
         offset += sprintf_s(cmdLine + offset, cmdSize - offset, " -c:a copy");
@@ -430,25 +428,32 @@ void Core_ConfigurePipeline(PhantomRecCore* core) {
     int winVer = GetWindowsVersion();
     
     if (winVer == 7) {
+        // GDI capture — ultrafast to compensate for software capture timing
         core->crf = 26; core->maxrate = 3000; core->bufsize = 6000;
         core->pipeBufferSizeMB = 2; core->videoQueueSize = 256;
-        core->convertPreset = 0;
+        core->convertPreset = 0;  // ultrafast
     } else if (winVer == 8) {
+        // DDAGrab (DXGI GPU capture) — veryfast for smooth playback
         core->crf = 26; core->maxrate = 4000; core->bufsize = 8000;
         core->pipeBufferSizeMB = 4; core->videoQueueSize = 512;
-        core->convertPreset = 0;
+        core->convertPreset = 1;  // veryfast
     } else if (cores <= 2) {
+        // DXGI GPU capture — veryfast
         core->crf = 23; core->maxrate = 4000; core->bufsize = 8000;
         core->pipeBufferSizeMB = 4; core->videoQueueSize = 512;
+        core->convertPreset = 1;  // veryfast
     } else if (cores <= 4) {
         core->crf = 23; core->maxrate = 6000; core->bufsize = 12000;
         core->pipeBufferSizeMB = 8; core->videoQueueSize = 512;
+        core->convertPreset = 1;  // veryfast
     } else if (cores <= 8) {
         core->crf = 23; core->maxrate = 8000; core->bufsize = 16000;
         core->pipeBufferSizeMB = 16; core->videoQueueSize = 512;
+        core->convertPreset = 2;  // medium
     } else {
         core->crf = 23; core->maxrate = 12000; core->bufsize = 24000;
         core->pipeBufferSizeMB = 32; core->videoQueueSize = 512;
+        core->convertPreset = 2;  // medium
     }
 }
 
