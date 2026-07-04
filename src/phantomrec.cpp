@@ -196,7 +196,7 @@ static void CreateDefaultIni() {
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
-        << "; Stage 1: Ut Video Lossless (CPU-friendly)\r\n"
+        << "; Stage 1: MPEG-4 Part 2 (CPU-friendly)\r\n"
         << "; Stage 2: x264 Post-Convert (after recording)\r\n"
         << ";\r\n"
         << "; CaptureMethod: How PhantomRec captures your screen\r\n"
@@ -213,17 +213,11 @@ static void CreateDefaultIni() {
         << "; ConvertAfterRecording: yes or no\r\n"
         << ";   yes = Automatically compress after recording (recommended)\r\n"
         << ";   no  = Keep the lossless temp file (very large)\r\n"
-        << ";\r\n"
-        << "; ConvertPreset: x264 compression speed/quality\r\n"
-        << ";   ultrafast = Fastest compression, larger file\r\n"
-        << ";   veryfast  = Balanced (recommended)\r\n"
-        << ";   medium    = Best compression, slower\r\n"
-        << "; ========================================\r\n\r\n"
+		<< "; ========================================\r\n\r\n"
         << "[Settings]\r\n"
         << "Hotkey=F10\r\n"
         << "PauseHotkey=P\r\n"
         << "ConvertAfterRecording=yes\r\n"
-        << "ConvertPreset=veryfast\r\n"
         << "CaptureMethod=auto\r\n";
     ini.close();
 }
@@ -240,11 +234,6 @@ static void LoadConfiguration() {
     
     GetPrivateProfileStringA("Settings", "ConvertAfterRecording", "yes", buf, sizeof(buf), g_iniPath.c_str());
     g_Core.convertAfterRecording = (strcmp(buf, "no") != 0);
-    
-    GetPrivateProfileStringA("Settings", "ConvertPreset", "medium", buf, sizeof(buf), g_iniPath.c_str());
-    if (strcmp(buf, "ultrafast") == 0) g_Core.convertPreset = 0;
-    else if (strcmp(buf, "veryfast") == 0) g_Core.convertPreset = 1;
-    else g_Core.convertPreset = 2;
     
     // Capture method
     char capBuf[32];
