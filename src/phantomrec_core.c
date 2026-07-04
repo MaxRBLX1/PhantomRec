@@ -1,7 +1,7 @@
 // phantomrec_core.c — PhantomRec v1.9.5 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// Max'sEngine™ | DXGI/GFX/DDAGrab/GDI Capture | Ut Video Stage 1 | x264 Stage 2 | WASAPI Audio
+// Max'sEngine™ | DXGI/GFX/DDAGrab/GDI Capture | MPEG-4 Stage 1 | x264 Stage 2 | WASAPI Audio
 //
 // Compile as part of PhantomRec.exe (link with C++ UI):
 //   gcc -std=c11 -O2 -c phantomrec_core.c -o phantomrec_core.o
@@ -367,7 +367,7 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     const char* rtbufsize = (core->captureMethod == 2) ? "500M" : "2000M";
     
     int offset = sprintf_s(cmdLine, cmdSize,
-        "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error"
+        "cmd.exe /c \"\"%s\" -y -fflags +genpts -hide_banner -loglevel error"
         " -rtbufsize %s"
         " -thread_queue_size %d"
         "%s",
@@ -382,8 +382,9 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     offset += sprintf_s(cmdLine + offset, cmdSize - offset,
         " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
         "%s"
-        " -c:v utvideo -pred left -pix_fmt yuv420p"
-        " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
+        " -c:v mpeg4 -q:v 0 -preset ultrafast -g 300"
+        " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv"
+        " -flush_packets 1",
         captureFilter);
     
     if (hasAudio) {
@@ -410,7 +411,7 @@ void Core_Init(PhantomRecCore* core, const char* maxsenginePath, const char* out
     core->pipeBufferSizeMB = 8;
     core->videoQueueSize = 512;
     core->dynamicThreads = 1;
-    
+    core->hAudioThread = NULL;
     QueryPerformanceFrequency(&core->recFreq);
 }
 
@@ -587,8 +588,7 @@ int Core_StartRecording(PhantomRecCore* core) {
     
     // Launch audio thread
     if (wasapiReady) {
-        HANDLE hThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
-        if (hThread) CloseHandle(hThread); // Fire and forget — cleanup on stop
+        core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
     }
     
     SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
@@ -602,27 +602,40 @@ int Core_StartRecording(PhantomRecCore* core) {
 }
 
 void Core_StopRecording(PhantomRecCore* core) {
-    if (!core->recording || core->paused) return;
-    
+    if (!core->recording) return;
+
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     core->lastRecordingDurationMs = (int)((now.QuadPart - core->recStart.QuadPart) * 1000 / core->recFreq.QuadPart);
     if (core->lastRecordingDurationMs < 1000) core->lastRecordingDurationMs = 1000;
-    
-    core->recording = 0;
-    
+
+    core->recording = 0;               // Signal audio thread to exit
+    core->paused = 0;                  // Clear pause flag (if any)
+
     // Restore power plan
     if (core->powerPlanChanged) {
         PowerSetActiveScheme(NULL, &core->originalPowerPlan);
         core->powerPlanChanged = 0;
     }
-    
-    // Stop audio
+	
+    // 1. Wake up the audio thread so it can see recording == 0 and exit
     if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
-    if (core->hAudioPipeWrite) { CloseHandle(core->hAudioPipeWrite); core->hAudioPipeWrite = NULL; }
+	
+    // 2. Wait for the audio thread to actually finish ← ADD THIS BLOCK
+    if (core->hAudioThread) {
+        WaitForSingleObject(core->hAudioThread, 5000);
+        CloseHandle(core->hAudioThread);
+        core->hAudioThread = NULL;
+    }
+
+    // 3. Now safe to close the pipe and clean up WASAPI
+    if (core->hAudioPipeWrite) {
+        CloseHandle(core->hAudioPipeWrite);
+        core->hAudioPipeWrite = NULL;
+    }
     CleanupWASAPI(core);
-    
-    // Stop FFmpeg
+
+    // 4. Stop FFmpeg (if it's still running – it might already be dead if paused)
     if (core->ffmpegProcess.hProcess) {
         SetConsoleCtrlHandler(NULL, TRUE);
         GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, core->ffmpegProcess.dwProcessId);
@@ -633,18 +646,17 @@ void Core_StopRecording(PhantomRecCore* core) {
         CloseHandle(core->ffmpegProcess.hThread);
         memset(&core->ffmpegProcess, 0, sizeof(core->ffmpegProcess));
     }
-    
+
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
     Sleep(1500);
-    
-    // Build segments list for Stage 2
+
+    // ----- Segment list & Stage 2 (unchanged) -----
     char segmentsTxt[MAX_PATH];
     sprintf_s(segmentsTxt, MAX_PATH, "%s\\segments.txt", core->outputDir);
-    
+
     FILE* segFile = NULL;
     fopen_s(&segFile, segmentsTxt, "w");
     int validSegments = 0;
-    
     for (int i = 0; i < core->segmentCount; i++) {
         if (Core_FileExists(core->segmentFiles[i]) && Core_GetFileSize(core->segmentFiles[i]) > 2048) {
             fprintf(segFile, "file '%s'\r\n", core->segmentFiles[i]);
@@ -652,66 +664,56 @@ void Core_StopRecording(PhantomRecCore* core) {
         }
     }
     if (segFile) fclose(segFile);
-    
+
     if (validSegments == 0) {
         DeleteFileA(segmentsTxt);
         if (core->onStatusUpdate) core->onStatusUpdate("No recording data found");
         return;
     }
-    
-    // Stage 2 — post-convert
+
     if (core->convertAfterRecording && core->lastRecordingDurationMs >= 1000) {
         core->converting = 1;
         core->convertProgress = 0;
-        
+
         if (core->onStatusUpdate) core->onStatusUpdate("Processing video...");
         if (core->onButtonUpdate) core->onButtonUpdate("Processing...");
-        
-        int threads = 1;
-        
-        const char* presetStr;
-        if (core->convertPreset == 0) presetStr = "ultrafast";
-        else if (core->convertPreset == 1) presetStr = "veryfast";
-        else presetStr = "medium";
-        
+
         char cmdLine[4096];
         sprintf_s(cmdLine, sizeof(cmdLine),
-            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" -fps_mode cfr -r 60 -c:v libx264 -preset %s -crf %d -c:a aac -b:a 128k -pix_fmt yuv420p -threads %d \"%s\"\"",
-            core->maxsenginePath, segmentsTxt, presetStr, core->crf, threads, core->finalFile);
-        
+            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" -fps_mode cfr -c:v libx264 -preset ultrafast -crf %d -c:a aac -b:a 128k -pix_fmt yuv420p -threads 1 \"%s\"\"",
+            core->maxsenginePath, segmentsTxt, core->crf, core->finalFile);
+
         HANDLE hRead, hWrite;
         SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
         CreatePipe(&hRead, &hWrite, &sa, 0);
         SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-        
+
         STARTUPINFOA siConv = { sizeof(siConv) };
         siConv.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-        siConv.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        siConv.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
         siConv.hStdOutput = hWrite;
-        siConv.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        siConv.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
         siConv.wShowWindow = SW_HIDE;
-        
+
         PROCESS_INFORMATION convertPI = {0};
         SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
-        
+
         if (CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-            CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS,
+            CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
             NULL, NULL, &siConv, &convertPI)) {
             CloseHandle(hWrite);
-            
+
             char buf[512];
             char lineBuffer[4096] = {0};
             int lineLen = 0;
             DWORD bytesRead;
             long long totalDurationUs = (long long)core->lastRecordingDurationMs * 1000;
-            
+
             while (ReadFile(hRead, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
                 buf[bytesRead] = '\0';
-                
                 for (DWORD i = 0; i < bytesRead; i++) {
                     if (buf[i] == '\n') {
                         lineBuffer[lineLen] = '\0';
-                        
                         if (strncmp(lineBuffer, "out_time_ms=", 12) == 0) {
                             long long timeUs = _atoi64(lineBuffer + 12);
                             int percent = (totalDurationUs > 0) ? (int)((timeUs * 100) / totalDurationUs) : 0;
@@ -719,30 +721,28 @@ void Core_StopRecording(PhantomRecCore* core) {
                             core->convertProgress = percent;
                             if (core->onProgressUpdate) core->onProgressUpdate(percent);
                         }
-                        
                         lineLen = 0;
                     } else if (buf[i] != '\r') {
-                        if (lineLen < (int)sizeof(lineBuffer) - 1) {
+                        if (lineLen < (int)sizeof(lineBuffer) - 1)
                             lineBuffer[lineLen++] = buf[i];
-                        }
                     }
                 }
             }
-            
+
             CloseHandle(hRead);
             WaitForSingleObject(convertPI.hProcess, INFINITE);
             CloseHandle(convertPI.hProcess);
             CloseHandle(convertPI.hThread);
             SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-            
+
             DeleteFileA(segmentsTxt);
             for (int i = 0; i < core->segmentCount; i++) {
                 if (Core_FileExists(core->segmentFiles[i])) DeleteFileA(core->segmentFiles[i]);
             }
-            
+
             core->converting = 0;
             core->convertProgress = 0;
-            
+
             long long fs = Core_GetFileSize(core->finalFile);
             if (fs > 2048) {
                 core->totalBytes += fs;
@@ -758,17 +758,44 @@ void Core_StopRecording(PhantomRecCore* core) {
 }
 
 void Core_TogglePause(PhantomRecCore* core) {
-    // Pause/resume preserves the existing architecture
-    // For v1.9.5, pause triggers full stop and restart
     if (!core->recording || core->converting) return;
     
     core->paused = !core->paused;
     
     if (core->paused) {
+        // PAUSE — Stop FFmpeg and audio, same as v1.5
         QueryPerformanceCounter(&core->pauseTime);
+        
+        // Stop audio thread
+        if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
+		
+        // 2. Wait for it to finish
+        if (core->hAudioThread) {
+            WaitForSingleObject(core->hAudioThread, 5000);
+            CloseHandle(core->hAudioThread);
+            core->hAudioThread = NULL;
+        }
+		
+        if (core->hAudioPipeWrite) { CloseHandle(core->hAudioPipeWrite); core->hAudioPipeWrite = NULL; }
+        CleanupWASAPI(core);
+        
+        // Stop FFmpeg
+        if (core->ffmpegProcess.hProcess) {
+            SetConsoleCtrlHandler(NULL, TRUE);
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, core->ffmpegProcess.dwProcessId);
+            DWORD wr = WaitForSingleObject(core->ffmpegProcess.hProcess, 6000);
+            if (wr == WAIT_TIMEOUT) TerminateProcess(core->ffmpegProcess.hProcess, 0);
+            SetConsoleCtrlHandler(NULL, FALSE);
+            CloseHandle(core->ffmpegProcess.hProcess);
+            CloseHandle(core->ffmpegProcess.hThread);
+            memset(&core->ffmpegProcess, 0, sizeof(core->ffmpegProcess));
+        }
+        
         if (core->onStatusUpdate) core->onStatusUpdate("PAUSED");
         if (core->onButtonUpdate) core->onButtonUpdate("RESUME");
+        
     } else {
+        // RESUME — Calculate pause duration, create new segment
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         core->totalPausedDurationMs += (long long)((now.QuadPart - core->pauseTime.QuadPart) * 1000 / core->recFreq.QuadPart);
@@ -778,6 +805,45 @@ void Core_TogglePause(PhantomRecCore* core) {
             "%s\\%s_seg%d_temp.mkv",
             core->outputDir, core->segmentBaseName, core->pauseSegmentCount);
         core->segmentCount++;
+        
+        // Initialize audio for new segment
+        int wasapiReady = InitializeWASAPI(core);
+        if (wasapiReady) {
+            SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+            CreatePipe(&core->hAudioPipeRead, &core->hAudioPipeWrite, &sa, core->pipeBufferSizeMB * 1024 * 1024);
+            SetHandleInformation(core->hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
+        }
+        
+        // Build and launch new FFmpeg for new segment
+        char cmdLine[4096];
+        BuildCaptureCommand(core, core->segmentFiles[core->segmentCount - 1], wasapiReady, cmdLine, sizeof(cmdLine));
+        
+        STARTUPINFOA si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        if (wasapiReady && core->hAudioPipeRead) {
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdInput = core->hAudioPipeRead;
+            si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+            si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        }
+        si.wShowWindow = SW_HIDE;
+        
+        if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
+            CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
+            NULL, NULL, &si, &core->ffmpegProcess)) {
+            if (wasapiReady) CleanupWASAPI(core);
+            return;
+        }
+        
+        if (core->hAudioPipeRead) {
+            CloseHandle(core->hAudioPipeRead);
+            core->hAudioPipeRead = NULL;
+        }
+        
+        // Launch audio thread for new segment
+        if (wasapiReady) {
+            core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
+        }
         
         if (core->onStatusUpdate) core->onStatusUpdate("Recording...");
         if (core->onButtonUpdate) core->onButtonUpdate("STOP");
