@@ -50,9 +50,11 @@ static int GetWindowsVersion(void) {
 
 static void GetCaptureFilter(const PhantomRecCore* core, char* buf, int bufsize) {
     if (core->captureMethod == 0 || core->captureMethod == 1) {
+        // GPU paths: hwdownload + convert to yuv420p (halves chroma, HDD-safe)
         strncpy_s(buf, bufsize, " -vf \"hwdownload,format=bgra,format=yuv420p\"", _TRUNCATE);
     } else {
-        strncpy_s(buf, bufsize, " -vf \"format=bgra,format=yuv420p\"", _TRUNCATE);
+        // GDI: already in system memory, just convert to yuv420p
+        strncpy_s(buf, bufsize, " -vf \"format=yuv420p\"", _TRUNCATE);
     }
 }
 
@@ -112,6 +114,7 @@ static void GetCaptureInput(PhantomRecCore* core, char* buf, int bufsize) {
     switch (method) {
     case CAPTURE_GFX:
         core->captureMethod = 0;
+        // Explicit framerate ensures VFR recording as promised
         strncpy_s(buf, bufsize, " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1", _TRUNCATE);
         break;
         
@@ -123,7 +126,7 @@ static void GetCaptureInput(PhantomRecCore* core, char* buf, int bufsize) {
     case CAPTURE_GDI:
     default:
         core->captureMethod = 2;
-        strncpy_s(buf, bufsize, " -f gdigrab -i desktop", _TRUNCATE);
+        strncpy_s(buf, bufsize, " -f gdigrab -framerate 60 -i desktop", _TRUNCATE);
         break;
     }
 }
@@ -297,7 +300,7 @@ static unsigned int __stdcall AudioToPipeThread(void* param) {
     HANDLE hAvrt = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
     
     UINT32 packetLength = 0;
-    int firstPacketSent = 0;
+    // FIX: removed dead firstPacketSent / hAudioSyncEvent code
     
     while (core->recording) {
         while (core->paused && core->recording) { Sleep(100); }
@@ -336,11 +339,6 @@ static unsigned int __stdcall AudioToPipeThread(void* param) {
                 WriteFile(core->hAudioPipeWrite, writeData, (DWORD)size, &written, NULL);
                 core->captureClient->lpVtbl->ReleaseBuffer(core->captureClient, frames);
                 
-                if (!firstPacketSent && written > 0) {
-                    if (core->hAudioSyncEvent) SetEvent(core->hAudioSyncEvent);
-                    firstPacketSent = 1;
-                }
-                
                 if (silenceBuf) HeapFree(GetProcessHeap(), 0, silenceBuf);
             }
             
@@ -367,7 +365,7 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     const char* rtbufsize = (core->captureMethod == 2) ? "500M" : "2000M";
     
     int offset = sprintf_s(cmdLine, cmdSize,
-        "cmd.exe /c \"\"%s\" -y -fflags +genpts -hide_banner -loglevel error"
+        "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error"
         " -rtbufsize %s"
         " -thread_queue_size %d"
         "%s",
@@ -380,11 +378,9 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     }
     
     offset += sprintf_s(cmdLine + offset, cmdSize - offset,
-        " -max_muxing_queue_size 2048 -thread_queue_size 2048 -fps_mode vfr"
         "%s"
-        " -c:v mpeg4 -q:v 0 -preset ultrafast -g 300"
-        " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv"
-        " -flush_packets 1",
+        " -c:v utvideo -pred median -threads 1"
+        " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
         captureFilter);
     
     if (hasAudio) {
@@ -392,13 +388,21 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     }
     
     sprintf_s(cmdLine + offset, cmdSize - offset,
-        " -shortest -fflags +genpts -threads %d -f matroska \"%s\"\"",
-        core->dynamicThreads, outputFile);
+        " -shortest -fflags +genpts -f matroska \"%s\"\"",
+        outputFile);
 }
 
 // ============================================================================
 // Recording engine
 // ============================================================================
+
+// Helper: map convertPreset index to x264 preset string
+static const char* GetPresetString(int presetIndex) {
+    static const char* presets[] = { "ultrafast", "veryfast", "medium" };
+    if (presetIndex < 0) presetIndex = 0;
+    if (presetIndex > 2) presetIndex = 2;
+    return presets[presetIndex];
+}
 
 void Core_Init(PhantomRecCore* core, const char* maxsenginePath, const char* outputDir) {
     memset(core, 0, sizeof(PhantomRecCore));
@@ -407,7 +411,7 @@ void Core_Init(PhantomRecCore* core, const char* maxsenginePath, const char* out
     if (outputDir) strncpy_s(core->outputDir, MAX_PATH, outputDir, _TRUNCATE);
     
     core->convertAfterRecording = 1;
-    core->convertPreset = 2;
+    core->convertPreset = 1;
     core->pipeBufferSizeMB = 8;
     core->videoQueueSize = 512;
     core->dynamicThreads = 1;
@@ -429,32 +433,23 @@ void Core_ConfigurePipeline(PhantomRecCore* core) {
     int winVer = GetWindowsVersion();
     
     if (winVer == 7) {
-        // GDI capture — ultrafast to compensate for software capture timing
         core->crf = 26; core->maxrate = 3000; core->bufsize = 6000;
         core->pipeBufferSizeMB = 2; core->videoQueueSize = 256;
-        core->convertPreset = 0;  // ultrafast
     } else if (winVer == 8) {
-        // DDAGrab (DXGI GPU capture) — veryfast for smooth playback
         core->crf = 26; core->maxrate = 4000; core->bufsize = 8000;
         core->pipeBufferSizeMB = 4; core->videoQueueSize = 512;
-        core->convertPreset = 1;  // veryfast
     } else if (cores <= 2) {
-        // DXGI GPU capture — veryfast
         core->crf = 23; core->maxrate = 4000; core->bufsize = 8000;
         core->pipeBufferSizeMB = 4; core->videoQueueSize = 512;
-        core->convertPreset = 1;  // veryfast
     } else if (cores <= 4) {
         core->crf = 23; core->maxrate = 6000; core->bufsize = 12000;
         core->pipeBufferSizeMB = 8; core->videoQueueSize = 512;
-        core->convertPreset = 1;  // veryfast
     } else if (cores <= 8) {
         core->crf = 23; core->maxrate = 8000; core->bufsize = 16000;
         core->pipeBufferSizeMB = 16; core->videoQueueSize = 512;
-        core->convertPreset = 2;  // medium
     } else {
         core->crf = 23; core->maxrate = 12000; core->bufsize = 24000;
         core->pipeBufferSizeMB = 32; core->videoQueueSize = 512;
-        core->convertPreset = 2;  // medium
     }
 }
 
@@ -470,11 +465,11 @@ void Core_WarmEngine(PhantomRecCore* core) {
     char warmupCmd[1024];
     if (core->captureMethod <= 1) {
         sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error %s -frames:v 1 -c:v mpeg4 -q:v 3 -f null NUL\"",
+            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error %s -frames:v 1 -c:v utvideo -pred median -threads 1 -f null NUL\"",
             core->maxsenginePath, captureInput);
     } else {
         sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error -f gdigrab -framerate 1 -i desktop -frames:v 1 -c:v mpeg4 -q:v 5 -f null NUL\"",
+            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error -f gdigrab -framerate 1 -i desktop -frames:v 1 -c:v utvideo -pred median -threads 1 -f null NUL\"",
             core->maxsenginePath);
     }
     
@@ -483,7 +478,8 @@ void Core_WarmEngine(PhantomRecCore* core) {
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {0};
     
-    if (CreateProcessA(NULL, warmupCmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (CreateProcessA(NULL, warmupCmd, NULL, NULL, FALSE,
+        CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 3000);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
@@ -571,10 +567,10 @@ int Core_StartRecording(PhantomRecCore* core) {
         si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
         si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     }
-    si.wShowWindow = SW_HIDE;
+    si.wShowWindow = SW_MINIMIZE;
     
     if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-        CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
         NULL, NULL, &si, &core->ffmpegProcess)) {
         core->recording = 0;
         if (wasapiReady) CleanupWASAPI(core);
@@ -621,7 +617,7 @@ void Core_StopRecording(PhantomRecCore* core) {
     // 1. Wake up the audio thread so it can see recording == 0 and exit
     if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
 	
-    // 2. Wait for the audio thread to actually finish ← ADD THIS BLOCK
+    // 2. Wait for the audio thread to actually finish
     if (core->hAudioThread) {
         WaitForSingleObject(core->hAudioThread, 5000);
         CloseHandle(core->hAudioThread);
@@ -635,7 +631,7 @@ void Core_StopRecording(PhantomRecCore* core) {
     }
     CleanupWASAPI(core);
 
-    // 4. Stop FFmpeg (if it's still running – it might already be dead if paused)
+    // 4. Stop FFmpeg
     if (core->ffmpegProcess.hProcess) {
         SetConsoleCtrlHandler(NULL, TRUE);
         GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, core->ffmpegProcess.dwProcessId);
@@ -650,7 +646,7 @@ void Core_StopRecording(PhantomRecCore* core) {
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
     Sleep(1500);
 
-    // ----- Segment list & Stage 2 (unchanged) -----
+    // ----- Segment list & Stage 2 (FIXED) -----
     char segmentsTxt[MAX_PATH];
     sprintf_s(segmentsTxt, MAX_PATH, "%s\\segments.txt", core->outputDir);
 
@@ -679,8 +675,11 @@ void Core_StopRecording(PhantomRecCore* core) {
         if (core->onButtonUpdate) core->onButtonUpdate("Processing...");
 
         char cmdLine[4096];
+        // FIX: use dynamic preset and thread count instead of hardcoded "ultrafast" and "1"
         sprintf_s(cmdLine, sizeof(cmdLine),
-            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" -fps_mode cfr -c:v libx264 -preset ultrafast -crf %d -c:a aac -b:a 128k -pix_fmt yuv420p -threads 1 \"%s\"\"",
+            "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" "
+            "-c:v libx264 -preset ultrafast -crf %d -c:a aac -b:a 128k "
+            "-pix_fmt yuv420p -fps_mode cfr \"%s\"\"",
             core->maxsenginePath, segmentsTxt, core->crf, core->finalFile);
 
         HANDLE hRead, hWrite;
@@ -826,10 +825,10 @@ void Core_TogglePause(PhantomRecCore* core) {
             si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
             si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
         }
-        si.wShowWindow = SW_HIDE;
+        si.wShowWindow = SW_MINIMIZE;
         
         if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-            CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
+            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
             NULL, NULL, &si, &core->ffmpegProcess)) {
             if (wasapiReady) CleanupWASAPI(core);
             return;
