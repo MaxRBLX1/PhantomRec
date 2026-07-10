@@ -1,7 +1,6 @@
 // phantomrec_core.h — PhantomRec v1.9.5 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// Max'sEngine™ | DXGI/GFX/DDAGrab/GDI Capture | MPEG-4 Stage 1 | x264 Stage 2 | WASAPI Audio
 
 #ifndef PHANTOMREC_CORE_H
 #define PHANTOMREC_CORE_H
@@ -51,7 +50,6 @@ typedef struct PhantomRecCore {
     int bufsize;
     int videoQueueSize;
     int pipeBufferSizeMB;
-    int convertPreset;  // 0=ultrafast, 1=veryfast, 2=medium
     
     // Session stats
     int sessions;
@@ -80,6 +78,7 @@ typedef struct PhantomRecCore {
     WAVEFORMATEX* waveFormat;
     int audioActive;
     HANDLE hAudioReadyEvent;
+	HANDLE hAudioStartEvent;
     HANDLE hAudioPipeWrite;
     HANDLE hAudioPipeRead;
     HANDLE hAudioSyncEvent;
