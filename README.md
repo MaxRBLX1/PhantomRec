@@ -111,7 +111,7 @@ When you press stop, PhantomRec converts the lossless master to a crisp, compact
 
 ---
 
-## Configuration
+## Settings How to control
 
 All settings are in **`Settings.ini`** (in the same folder as `PhantomRec.exe`). Edit it while the program is running — changes take effect within 2 seconds.
 
