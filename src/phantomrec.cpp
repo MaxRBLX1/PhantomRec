@@ -25,7 +25,7 @@ extern "C" {
 #include "phantomrec_core.h"
 }
 
-#define PHANTOMREC_VERSION "1.9.5 test"
+#define PHANTOMREC_VERSION "1.9.5"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -239,7 +239,7 @@ static void CreateDefaultIni() {
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
-        << "; Stage 1: MPEG-4 Part 2 (CPU-friendly)\r\n"
+        << "; Stage 1: Ut Video lossless\r\n"
         << "; Stage 2: x264 Post-Convert (after recording)\r\n"
         << ";\r\n"
         << "; CaptureMethod: How PhantomRec captures your screen\r\n"
