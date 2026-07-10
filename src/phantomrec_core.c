@@ -1,7 +1,7 @@
 // phantomrec_core.c — PhantomRec v1.9.5 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// Max'sEngine™ | DXGI/GFX/DDAGrab/GDI Capture | MPEG-4 Stage 1 | x264 Stage 2 | WASAPI Audio
+// Max'sEngine™ | DXGI/GFX/DDAGrab/GDI Capture | UTVideo Lossless | x264 Stage 2 | WASAPI Audio
 //
 // Compile as part of PhantomRec.exe (link with C++ UI):
 //   gcc -std=c11 -O2 -c phantomrec_core.c -o phantomrec_core.o
