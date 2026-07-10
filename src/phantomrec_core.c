@@ -58,9 +58,6 @@ static void GetCaptureFilter(const PhantomRecCore* core, char* buf, int bufsize)
     }
 }
 
-static int GetCaptureQuality(const PhantomRecCore* core) {
-    return (core->captureMethod == 2) ? 5 : 2;
-}
 
 // ============================================================================
 // Capture Method Management
@@ -299,6 +296,7 @@ static unsigned int __stdcall AudioToPipeThread(void* param) {
     DWORD taskIndex = 0;
     HANDLE hAvrt = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
     
+	WaitForSingleObject(core->hAudioStartEvent, INFINITE);
     UINT32 packetLength = 0;
     // FIX: removed dead firstPacketSent / hAudioSyncEvent code
     
@@ -367,9 +365,9 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     int offset = sprintf_s(cmdLine, cmdSize,
         "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error"
         " -rtbufsize %s"
-        " -thread_queue_size %d"
+        " -thread_queue_size 2048"
         "%s",
-        core->maxsenginePath, rtbufsize, core->videoQueueSize, captureInput);
+        core->maxsenginePath, rtbufsize, captureInput);
     
     if (hasAudio) {
         offset += sprintf_s(cmdLine + offset, cmdSize - offset,
@@ -379,6 +377,7 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     
     offset += sprintf_s(cmdLine + offset, cmdSize - offset,
         "%s"
+        " -max_muxing_queue_size 9096"
         " -c:v utvideo -pred median -threads 1"
         " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
         captureFilter);
@@ -396,14 +395,6 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
 // Recording engine
 // ============================================================================
 
-// Helper: map convertPreset index to x264 preset string
-static const char* GetPresetString(int presetIndex) {
-    static const char* presets[] = { "ultrafast", "veryfast", "medium" };
-    if (presetIndex < 0) presetIndex = 0;
-    if (presetIndex > 2) presetIndex = 2;
-    return presets[presetIndex];
-}
-
 void Core_Init(PhantomRecCore* core, const char* maxsenginePath, const char* outputDir) {
     memset(core, 0, sizeof(PhantomRecCore));
     
@@ -411,11 +402,10 @@ void Core_Init(PhantomRecCore* core, const char* maxsenginePath, const char* out
     if (outputDir) strncpy_s(core->outputDir, MAX_PATH, outputDir, _TRUNCATE);
     
     core->convertAfterRecording = 1;
-    core->convertPreset = 1;
     core->pipeBufferSizeMB = 8;
-    core->videoQueueSize = 512;
     core->dynamicThreads = 1;
     core->hAudioThread = NULL;
+	core->hAudioStartEvent = NULL;
     QueryPerformanceFrequency(&core->recFreq);
 }
 
@@ -434,22 +424,22 @@ void Core_ConfigurePipeline(PhantomRecCore* core) {
     
     if (winVer == 7) {
         core->crf = 26; core->maxrate = 3000; core->bufsize = 6000;
-        core->pipeBufferSizeMB = 2; core->videoQueueSize = 256;
+        core->pipeBufferSizeMB = 2;
     } else if (winVer == 8) {
         core->crf = 26; core->maxrate = 4000; core->bufsize = 8000;
-        core->pipeBufferSizeMB = 4; core->videoQueueSize = 512;
+        core->pipeBufferSizeMB = 4; 
     } else if (cores <= 2) {
         core->crf = 23; core->maxrate = 4000; core->bufsize = 8000;
-        core->pipeBufferSizeMB = 4; core->videoQueueSize = 512;
+        core->pipeBufferSizeMB = 4;
     } else if (cores <= 4) {
         core->crf = 23; core->maxrate = 6000; core->bufsize = 12000;
-        core->pipeBufferSizeMB = 8; core->videoQueueSize = 512;
+        core->pipeBufferSizeMB = 8;
     } else if (cores <= 8) {
         core->crf = 23; core->maxrate = 8000; core->bufsize = 16000;
-        core->pipeBufferSizeMB = 16; core->videoQueueSize = 512;
+        core->pipeBufferSizeMB = 16;
     } else {
         core->crf = 23; core->maxrate = 12000; core->bufsize = 24000;
-        core->pipeBufferSizeMB = 32; core->videoQueueSize = 512;
+        core->pipeBufferSizeMB = 32;
     }
 }
 
@@ -555,8 +545,16 @@ int Core_StartRecording(PhantomRecCore* core) {
     
     // Build FFmpeg command
     core->recording = 1;
-    char cmdLine[4096];
+    char cmdLine[8196];
     BuildCaptureCommand(core, core->tempFile, wasapiReady, cmdLine, sizeof(cmdLine));
+
+
+    // Launch audio thread (will block on hAudioStartEvent)
+    if (wasapiReady) {
+        if (core->hAudioStartEvent) CloseHandle(core->hAudioStartEvent);
+        core->hAudioStartEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+        core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
+    }
     
     // Launch FFmpeg
     STARTUPINFOA si = { sizeof(si) };
@@ -573,19 +571,39 @@ int Core_StartRecording(PhantomRecCore* core) {
         CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
         NULL, NULL, &si, &core->ffmpegProcess)) {
         core->recording = 0;
-        if (wasapiReady) CleanupWASAPI(core);
+		
+	    // Unblock the audio thread waiting on hAudioStartEvent
+        if (core->hAudioStartEvent) {
+            SetEvent(core->hAudioStartEvent);
+            CloseHandle(core->hAudioStartEvent);
+            core->hAudioStartEvent = NULL;
+        }
+
+        // Wake up the audio thread if it already passed the start event
+        if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
+        if (core->hAudioThread) {
+            WaitForSingleObject(core->hAudioThread, 5000);
+            CloseHandle(core->hAudioThread);
+            core->hAudioThread = NULL;
+        }
+        if (core->hAudioPipeWrite) { CloseHandle(core->hAudioPipeWrite); core->hAudioPipeWrite = NULL; }
+        CleanupWASAPI(core);
         return 0;
     }
-    
+	
+    // FFmpeg started – release the audio thread so they begin together
+    if (core->hAudioStartEvent) {
+        SetEvent(core->hAudioStartEvent);
+        CloseHandle(core->hAudioStartEvent);
+        core->hAudioStartEvent = NULL;
+    }
+	
+   
     if (core->hAudioPipeRead) {
         CloseHandle(core->hAudioPipeRead);
         core->hAudioPipeRead = NULL;
     }
     
-    // Launch audio thread
-    if (wasapiReady) {
-        core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
-    }
     
     SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
     QueryPerformanceCounter(&core->recStart);
@@ -674,12 +692,12 @@ void Core_StopRecording(PhantomRecCore* core) {
         if (core->onStatusUpdate) core->onStatusUpdate("Processing video...");
         if (core->onButtonUpdate) core->onButtonUpdate("Processing...");
 
-        char cmdLine[4096];
-        // FIX: use dynamic preset and thread count instead of hardcoded "ultrafast" and "1"
+        char cmdLine[8196];
+        
         sprintf_s(cmdLine, sizeof(cmdLine),
             "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" "
             "-c:v libx264 -preset ultrafast -crf %d -c:a aac -b:a 128k "
-            "-pix_fmt yuv420p -fps_mode cfr \"%s\"\"",
+            "-pix_fmt yuv420p -r 60 -fps_mode cfr \"%s\"\"",
             core->maxsenginePath, segmentsTxt, core->crf, core->finalFile);
 
         HANDLE hRead, hWrite;
@@ -812,9 +830,15 @@ void Core_TogglePause(PhantomRecCore* core) {
             CreatePipe(&core->hAudioPipeRead, &core->hAudioPipeWrite, &sa, core->pipeBufferSizeMB * 1024 * 1024);
             SetHandleInformation(core->hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
         }
+		
+        if (wasapiReady) {
+            if (core->hAudioStartEvent) CloseHandle(core->hAudioStartEvent);
+            core->hAudioStartEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+            core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
+        }
         
         // Build and launch new FFmpeg for new segment
-        char cmdLine[4096];
+        char cmdLine[8196];
         BuildCaptureCommand(core, core->segmentFiles[core->segmentCount - 1], wasapiReady, cmdLine, sizeof(cmdLine));
         
         STARTUPINFOA si = { sizeof(si) };
@@ -827,22 +851,37 @@ void Core_TogglePause(PhantomRecCore* core) {
         }
         si.wShowWindow = SW_MINIMIZE;
         
-        if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
-            NULL, NULL, &si, &core->ffmpegProcess)) {
-            if (wasapiReady) CleanupWASAPI(core);
-            return;
+    if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
+        NULL, NULL, &si, &core->ffmpegProcess)) {
+        // Unblock the audio thread waiting on hAudioStartEvent
+        if (core->hAudioStartEvent) {
+            SetEvent(core->hAudioStartEvent);
+            CloseHandle(core->hAudioStartEvent);
+            core->hAudioStartEvent = NULL;
         }
-        
-        if (core->hAudioPipeRead) {
-            CloseHandle(core->hAudioPipeRead);
-            core->hAudioPipeRead = NULL;
+        if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
+        if (core->hAudioThread) {
+            WaitForSingleObject(core->hAudioThread, 5000);
+            CloseHandle(core->hAudioThread);
+            core->hAudioThread = NULL;
         }
-        
-        // Launch audio thread for new segment
-        if (wasapiReady) {
-            core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
-        }
+        if (core->hAudioPipeWrite) { CloseHandle(core->hAudioPipeWrite); core->hAudioPipeWrite = NULL; }
+        CleanupWASAPI(core);
+        return;
+    }
+    
+    // FFmpeg started – release the audio thread so they begin together
+    if (core->hAudioStartEvent) {
+        SetEvent(core->hAudioStartEvent);
+        CloseHandle(core->hAudioStartEvent);
+        core->hAudioStartEvent = NULL;
+    }
+
+    if (core->hAudioPipeRead) {
+        CloseHandle(core->hAudioPipeRead);
+        core->hAudioPipeRead = NULL;
+    }
         
         if (core->onStatusUpdate) core->onStatusUpdate("Recording...");
         if (core->onButtonUpdate) core->onButtonUpdate("STOP");
