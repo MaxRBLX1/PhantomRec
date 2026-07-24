@@ -1,4 +1,4 @@
-# PhantomRec — "Record now. Encode later. Zero lag."
+# PhantomRec — "Record with lightweight compression now. Encode with heavy compression later."
 
 **Built by MaxRBLX1**
 **v1.9.5**
