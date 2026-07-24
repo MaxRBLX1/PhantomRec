@@ -87,13 +87,18 @@ static void GetCaptureInput(PhantomRecCore* core, char* buf, int bufsize) {
     CaptureMethod method = g_UserCaptureMethod;
     
     if (method == CAPTURE_AUTO) {
-        // Auto: pick the best method available for this OS
+        // Auto: pick the best method based on OS and CPU cores
         if (winVer >= 10) {
-            method = CAPTURE_GFX;        // Win10/11: GPU zero-copy, best quality
+            // Only use GFX on 8+ core systems (prevents microshutters on lower-end)
+            if (core->cpuCoreCount >= 8) {
+                method = CAPTURE_GFX;        // Zero-copy, best quality
+            } else {
+                method = CAPTURE_DDAGRAB;    // More stable on lower-core systems
+            }
         } else if (winVer >= 8) {
-            method = CAPTURE_DDAGRAB;    // Win8/8.1: GPU DirectDraw, 60 FPS
+            method = CAPTURE_DDAGRAB;        // Win8/8.1: DDAGrab is the best option
         } else {
-            method = CAPTURE_GDI;        // Win7/Vista: CPU software, 55 FPS sweet spot
+            method = CAPTURE_GDI;            // Win7/Vista: GDI is universal
         }
     }
     
@@ -111,7 +116,6 @@ static void GetCaptureInput(PhantomRecCore* core, char* buf, int bufsize) {
     switch (method) {
     case CAPTURE_GFX:
         core->captureMethod = 0;
-        // Explicit framerate ensures VFR recording as promised
         strncpy_s(buf, bufsize, " -f lavfi -i gfxcapture=monitor_idx=0:capture_cursor=1", _TRUNCATE);
         break;
         
@@ -360,34 +364,40 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     GetCaptureInput(core, captureInput, sizeof(captureInput));
     GetCaptureFilter(core, captureFilter, sizeof(captureFilter));
     
-    const char* rtbufsize = (core->captureMethod == 2) ? "500M" : "2000M";
+    // BUFFERSIZE: 2048M for ALL capture methods (unified)
+    const char* rtbufsize = "2048M";
+    
+    // SLICES: use ALL cores for parallel frame encoding
+    int encoderSlices = core->cpuCoreCount;
+    if (encoderSlices < 1) encoderSlices = 1;
+    core->dynamicThreads = encoderSlices;  // UI shows slices count
     
     int offset = sprintf_s(cmdLine, cmdSize,
         "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error"
         " -rtbufsize %s"
-        " -thread_queue_size 2048"
+        " -thread_queue_size 4096"
         "%s",
         core->maxsenginePath, rtbufsize, captureInput);
     
     if (hasAudio) {
         offset += sprintf_s(cmdLine + offset, cmdSize - offset,
-            " -thread_queue_size 512 -f %s -ar %d -ac %d -i pipe:0",
+            " -itsoffset 0.0 -thread_queue_size 4096 -f %s -ar %d -ac %d -i pipe:0",
             core->audioFormat, core->audioSampleRate, core->audioChannels);
     }
     
     offset += sprintf_s(cmdLine + offset, cmdSize - offset,
         "%s"
-        " -max_muxing_queue_size 9096"
-        " -c:v utvideo -pred median -threads 1"
+        " -max_muxing_queue_size 50000"
+        " -c:v utvideo -pred median -slices %d"   // SLICES, not threads
         " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
-        captureFilter);
+        captureFilter, encoderSlices);
     
     if (hasAudio) {
         offset += sprintf_s(cmdLine + offset, cmdSize - offset, " -c:a copy");
     }
     
     sprintf_s(cmdLine + offset, cmdSize - offset,
-        " -shortest -fflags +genpts -f matroska \"%s\"\"",
+        " -fflags +genpts -f matroska \"%s\"\"",
         outputFile);
 }
 
@@ -419,6 +429,10 @@ void Core_ConfigurePipeline(PhantomRecCore* core) {
     GetSystemInfo(&si);
     int cores = si.dwNumberOfProcessors;
     core->cpuCoreCount = cores;
+    
+    // Set dynamicThreads for UI display – now represents slices (full cores)
+    core->dynamicThreads = cores;
+    if (core->dynamicThreads < 1) core->dynamicThreads = 1;
     
     int winVer = GetWindowsVersion();
     
@@ -452,15 +466,19 @@ void Core_WarmEngine(PhantomRecCore* core) {
     char captureInput[512];
     GetCaptureInput(core, captureInput, sizeof(captureInput));
     
+    // Use full core count for slices (matches BuildCaptureCommand)
+    int warmupSlices = core->cpuCoreCount;
+    if (warmupSlices < 1) warmupSlices = 1;
+    
     char warmupCmd[1024];
     if (core->captureMethod <= 1) {
         sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error %s -frames:v 1 -c:v utvideo -pred median -threads 1 -f null NUL\"",
-            core->maxsenginePath, captureInput);
+            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error %s -frames:v 3 -c:v utvideo -pred median -slices %d -f null NUL\"",
+            core->maxsenginePath, captureInput, warmupSlices);
     } else {
         sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error -f gdigrab -framerate 1 -i desktop -frames:v 1 -c:v utvideo -pred median -threads 1 -f null NUL\"",
-            core->maxsenginePath);
+            "cmd.exe /c \"\"%s\" -y -hide_banner -loglevel error -f gdigrab -framerate 60 -i desktop -frames:v 3 -c:v utvideo -pred median -slices %d -f null NUL\"",
+            core->maxsenginePath, warmupSlices);
     }
     
     STARTUPINFOA si = { sizeof(si) };
@@ -696,7 +714,7 @@ void Core_StopRecording(PhantomRecCore* core) {
         
         sprintf_s(cmdLine, sizeof(cmdLine),
             "cmd.exe /c \"\"%s\" -y -progress pipe:1 -loglevel error -f concat -safe 0 -i \"%s\" "
-            "-c:v libx264 -preset ultrafast -crf %d -c:a aac -b:a 128k "
+            "-c:v libx264 -preset ultrafast -crf %d -c:a aac -b:a 128k -async 1 "
             "-pix_fmt yuv420p -r 60 -fps_mode cfr \"%s\"\"",
             core->maxsenginePath, segmentsTxt, core->crf, core->finalFile);
 
@@ -780,28 +798,30 @@ void Core_TogglePause(PhantomRecCore* core) {
     core->paused = !core->paused;
     
     if (core->paused) {
-        // PAUSE — Stop FFmpeg and audio, same as v1.5
+        // ---------- PAUSE ----------
         QueryPerformanceCounter(&core->pauseTime);
         
-        // Stop audio thread
+        // Stop audio thread (100ms max)
         if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
-		
-        // 2. Wait for it to finish
         if (core->hAudioThread) {
-            WaitForSingleObject(core->hAudioThread, 5000);
+            WaitForSingleObject(core->hAudioThread, 100);
             CloseHandle(core->hAudioThread);
             core->hAudioThread = NULL;
         }
-		
-        if (core->hAudioPipeWrite) { CloseHandle(core->hAudioPipeWrite); core->hAudioPipeWrite = NULL; }
+        if (core->hAudioPipeWrite) {
+            CloseHandle(core->hAudioPipeWrite);
+            core->hAudioPipeWrite = NULL;
+        }
         CleanupWASAPI(core);
         
-        // Stop FFmpeg
+        // Stop FFmpeg (500ms max, then terminate)
         if (core->ffmpegProcess.hProcess) {
             SetConsoleCtrlHandler(NULL, TRUE);
             GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, core->ffmpegProcess.dwProcessId);
-            DWORD wr = WaitForSingleObject(core->ffmpegProcess.hProcess, 6000);
-            if (wr == WAIT_TIMEOUT) TerminateProcess(core->ffmpegProcess.hProcess, 0);
+            DWORD wr = WaitForSingleObject(core->ffmpegProcess.hProcess, 500);
+            if (wr == WAIT_TIMEOUT) {
+                TerminateProcess(core->ffmpegProcess.hProcess, 0);
+            }
             SetConsoleCtrlHandler(NULL, FALSE);
             CloseHandle(core->ffmpegProcess.hProcess);
             CloseHandle(core->ffmpegProcess.hThread);
@@ -812,10 +832,16 @@ void Core_TogglePause(PhantomRecCore* core) {
         if (core->onButtonUpdate) core->onButtonUpdate("RESUME");
         
     } else {
-        // RESUME — Calculate pause duration, create new segment
+        // ---------- RESUME ----------
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         core->totalPausedDurationMs += (long long)((now.QuadPart - core->pauseTime.QuadPart) * 1000 / core->recFreq.QuadPart);
+        
+        // Guard against segment overflow
+        if (core->segmentCount >= 64) {
+            if (core->onStatusUpdate) core->onStatusUpdate("Too many segments – stop and restart");
+            return;
+        }
         
         core->pauseSegmentCount++;
         sprintf_s(core->segmentFiles[core->segmentCount], MAX_PATH,
@@ -823,14 +849,15 @@ void Core_TogglePause(PhantomRecCore* core) {
             core->outputDir, core->segmentBaseName, core->pauseSegmentCount);
         core->segmentCount++;
         
-        // Initialize audio for new segment
+        // Reinitialize WASAPI and audio pipe
         int wasapiReady = InitializeWASAPI(core);
         if (wasapiReady) {
             SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
             CreatePipe(&core->hAudioPipeRead, &core->hAudioPipeWrite, &sa, core->pipeBufferSizeMB * 1024 * 1024);
             SetHandleInformation(core->hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
         }
-		
+        
+        // Launch audio thread
         if (wasapiReady) {
             if (core->hAudioStartEvent) CloseHandle(core->hAudioStartEvent);
             core->hAudioStartEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
@@ -851,37 +878,50 @@ void Core_TogglePause(PhantomRecCore* core) {
         }
         si.wShowWindow = SW_MINIMIZE;
         
-    if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
-        NULL, NULL, &si, &core->ffmpegProcess)) {
-        // Unblock the audio thread waiting on hAudioStartEvent
+        if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
+            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
+            NULL, NULL, &si, &core->ffmpegProcess)) {
+            // Resume failed – stop recording entirely
+            core->recording = 0;
+            core->paused = 0;
+            
+            if (core->hAudioStartEvent) {
+                SetEvent(core->hAudioStartEvent);
+                CloseHandle(core->hAudioStartEvent);
+                core->hAudioStartEvent = NULL;
+            }
+            if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
+            if (core->hAudioThread) {
+                WaitForSingleObject(core->hAudioThread, 100);
+                CloseHandle(core->hAudioThread);
+                core->hAudioThread = NULL;
+            }
+            if (core->hAudioPipeWrite) {
+                CloseHandle(core->hAudioPipeWrite);
+                core->hAudioPipeWrite = NULL;
+            }
+            CleanupWASAPI(core);
+            
+            if (core->powerPlanChanged) {
+                PowerSetActiveScheme(NULL, &core->originalPowerPlan);
+                core->powerPlanChanged = 0;
+            }
+            
+            if (core->onStatusUpdate) core->onStatusUpdate("Resume failed – recording stopped");
+            if (core->onButtonUpdate) core->onButtonUpdate("START");
+            return;
+        }
+        
+        // FFmpeg started – release audio thread
         if (core->hAudioStartEvent) {
             SetEvent(core->hAudioStartEvent);
             CloseHandle(core->hAudioStartEvent);
             core->hAudioStartEvent = NULL;
         }
-        if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
-        if (core->hAudioThread) {
-            WaitForSingleObject(core->hAudioThread, 5000);
-            CloseHandle(core->hAudioThread);
-            core->hAudioThread = NULL;
+        if (core->hAudioPipeRead) {
+            CloseHandle(core->hAudioPipeRead);
+            core->hAudioPipeRead = NULL;
         }
-        if (core->hAudioPipeWrite) { CloseHandle(core->hAudioPipeWrite); core->hAudioPipeWrite = NULL; }
-        CleanupWASAPI(core);
-        return;
-    }
-    
-    // FFmpeg started – release the audio thread so they begin together
-    if (core->hAudioStartEvent) {
-        SetEvent(core->hAudioStartEvent);
-        CloseHandle(core->hAudioStartEvent);
-        core->hAudioStartEvent = NULL;
-    }
-
-    if (core->hAudioPipeRead) {
-        CloseHandle(core->hAudioPipeRead);
-        core->hAudioPipeRead = NULL;
-    }
         
         if (core->onStatusUpdate) core->onStatusUpdate("Recording...");
         if (core->onButtonUpdate) core->onButtonUpdate("STOP");
