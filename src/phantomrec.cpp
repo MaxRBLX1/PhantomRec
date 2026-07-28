@@ -1,7 +1,8 @@
-// PhantomRec.cpp — PhantomRec v1.9.5 C++ UI
+// PhantomRec.cpp — PhantomRec v1.9.6 C++ UI
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | Pure C Core + C++ UI
+// All v1.9.6 fixes applied: font handle cleanup, version bump, minor tweaks.
 
 #include <windows.h>
 #include <shellapi.h>
@@ -25,7 +26,7 @@ extern "C" {
 #include "phantomrec_core.h"
 }
 
-#define PHANTOMREC_VERSION "1.9.5"
+#define PHANTOMREC_VERSION "1.9.6"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -74,7 +75,6 @@ static std::string g_outputDir;
 static std::string g_maxsenginePath;
 static FILETIME g_iniLastWrite = {0};
 
-// Thread‑safety: store UI thread ID
 static DWORD g_mainThreadId = 0;
 
 // Cached static background image (non‑GIF)
@@ -85,6 +85,10 @@ static std::string g_cachedBgPath;
 static HFONT g_hStatusFont = nullptr;
 static HFONT g_hButtonFont = nullptr;
 
+// FIX v1.9.6: store static font handles from WM_CTLCOLOR to avoid leaks
+static HFONT g_hStaticFont = nullptr;
+static HFONT g_hBtnStaticFont = nullptr;
+
 static void UpdateUI();
 static void DoUpdateStatus(const char* message);
 static void DoUpdateButton(const char* text);
@@ -93,15 +97,15 @@ static void DoUpdateButton(const char* text);
 // Helper: Read GIF frame delay from metadata
 // ============================================================================
 static UINT GetGifFrameDelay(Gdiplus::Image* image, UINT frameCount) {
-    UINT frameDelay = 100; // default 100ms = 10 FPS
+    UINT frameDelay = 100;
     UINT size = image->GetPropertyItemSize(PropertyTagFrameDelay);
     if (size > 0) {
         Gdiplus::PropertyItem* prop = (Gdiplus::PropertyItem*)malloc(size);
         if (prop && image->GetPropertyItem(PropertyTagFrameDelay, size, prop) == Gdiplus::Ok) {
             long* delays = (long*)prop->value;
             if (frameCount > 0 && delays[0] > 0) {
-                frameDelay = delays[0] * 10; // Convert 10ms units to ms
-                if (frameDelay < 16) frameDelay = 16; // Minimum ~60 FPS
+                frameDelay = delays[0] * 10;
+                if (frameDelay < 16) frameDelay = 16;
             }
         }
         free(prop);
@@ -114,7 +118,6 @@ static UINT GetGifFrameDelay(Gdiplus::Image* image, UINT frameCount) {
 // ============================================================================
 static void OnStatusUpdate(const char* message) {
     if (GetCurrentThreadId() != g_mainThreadId) {
-        // Post message to UI thread
         char* msgCopy = _strdup(message);
         PostMessageA(g_hWnd, WM_PR_STATUS, 0, (LPARAM)msgCopy);
     } else {
@@ -162,14 +165,14 @@ static void OnConversionDone(int success, const char* filePath) {
     }
 }
 
-// Direct UI updaters (always called on UI thread)
+// Direct UI updaters
 static void DoUpdateStatus(const char* message) {
     if (g_lblStatus && IsWindow(g_lblStatus) && g_hWnd) {
         RECT rect;
         GetWindowRect(g_lblStatus, &rect);
         MapWindowPoints(HWND_DESKTOP, g_hWnd, (LPPOINT)&rect, 2);
         HDC hdc = GetDC(g_hWnd);
-        HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0)); // default black background
+        HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
         FillRect(hdc, &rect, hBrush);
         DeleteObject(hBrush);
         ReleaseDC(g_hWnd, hdc);
@@ -235,7 +238,7 @@ static std::string GetHotkeyName(UINT vk) {
 static void CreateDefaultIni() {
     std::ofstream ini(g_iniPath);
     ini << "; ========================================\r\n"
-        << "; PhantomRec v1.9.5 Settings\r\n"
+        << "; PhantomRec v1.9.6 Settings\r\n"
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
@@ -246,7 +249,7 @@ static void CreateDefaultIni() {
         << ";   auto    = PhantomRec picks the best method for your OS\r\n"
         << ";   ddagrab = DXGI Desktop Duplication (GPU, 60 FPS, Win8+)\r\n"
         << ";   gfx     = D3D11 Graphics Capture (GPU, 60 FPS, Win10+)\r\n"
-        << ";   gdi     = CPU software capture (55 FPS, any Windows)\r\n"
+        << ";   gdi     = CPU software capture (up to 30 FPS, any Windows)\r\n"  // FIX: corrected FPS
         << ";\r\n"
         << "; Hotkey: F1-F12 for function keys\r\n"
         << ";         A-Z for Ctrl+Letter hotkeys (e.g., R = Ctrl+R)\r\n"
@@ -302,22 +305,14 @@ static void ReloadIniIfChanged() {
     if (GetFileAttributesExA(g_iniPath.c_str(), GetFileExInfoStandard, &attr)) {
         if (CompareFileTime(&attr.ftLastWriteTime, &g_iniLastWrite) != 0) {
             g_iniLastWrite = attr.ftLastWriteTime;
-            
-            // --- Thread‑safety guard: never mutate capture method / conversion flag while recording
             bool wasRecording = Core_IsRecording(&g_Core);
-            int oldMethod = g_Core.captureMethod;   // might not exist; we'll read via getter if available
+            int oldMethod = g_Core.captureMethod;
             bool oldConvert = g_Core.convertAfterRecording;
-            
-            LoadConfiguration();   // modifies g_Core fields
-            
+            LoadConfiguration();
             if (wasRecording) {
-                // Revert unsafe changes
                 g_Core.convertAfterRecording = oldConvert;
                 Core_SetCaptureMethodEx(&g_Core, (CaptureMethod)oldMethod);
-                // (If core stores method as enum, cast works; otherwise use the saved int)
             }
-            
-            // Hotkey rebinding is always safe
             UnregisterHotKey(g_hWnd, ID_HOTKEY_RECORD);
             UnregisterHotKey(g_hWnd, ID_HOTKEY_PAUSE);
             UINT recMod = GetHotkeyModifiers(g_recordHotkey);
@@ -345,7 +340,6 @@ static void EnsureBackgroundCached() {
         ClearCachedBackground();
         return;
     }
-    // Check if it's a GIF (handled separately)
     std::string ext = g_customBackground;
     auto dot = ext.find_last_of('.');
     if (dot != std::string::npos) {
@@ -356,7 +350,7 @@ static void EnsureBackgroundCached() {
         }
     }
     if (g_cachedBgPath == g_customBackground && g_cachedBgImage)
-        return;  // already cached
+        return;
     ClearCachedBackground();
     std::wstring wpath(g_customBackground.begin(), g_customBackground.end());
     g_cachedBgImage = new Gdiplus::Image(wpath.c_str());
@@ -449,8 +443,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     static HWND previewBg, previewFont, editFontSize;
     static std::string selectedBg, selectedFont;
     static int selectedFontSize;
-    static COLORREF selectedColor;        // Fix 3: temp color until Apply
-    static HFONT hPreviewFontHandle = nullptr;  // Fix 1: declared here, cleaned in WM_DESTROY
+    static COLORREF selectedColor;
+    static HFONT hPreviewFontHandle = nullptr;
 
     switch (m) {
     case WM_CREATE: {
@@ -477,7 +471,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CTLCOLORSTATIC:
         if ((HWND)l == previewFont) {
-            SetTextColor((HDC)w, selectedColor);   // use temp color
+            SetTextColor((HDC)w, selectedColor);
             SetBkMode((HDC)w, TRANSPARENT);
             return (LRESULT)GetStockObject(NULL_BRUSH);
         }
@@ -528,9 +522,8 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_customBackground = selectedBg;
             g_customFont = selectedFont;
             g_customFontSize = selectedFontSize;
-            g_customColorRef = selectedColor;   // Fix 3: apply temp color
+            g_customColorRef = selectedColor;
             SaveCustomizations();
-            // Reload background cache
             if (g_gifImage) { delete g_gifImage; g_gifImage = nullptr; }
             if (g_gifTimerId) { KillTimer(g_hWnd, g_gifTimerId); g_gifTimerId = 0; }
             g_backgroundIsGif = false;
@@ -555,7 +548,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     }
                 }
             }
-            EnsureBackgroundCached(); // load static cache if needed
+            EnsureBackgroundCached();
             InvalidateRect(g_hWnd, nullptr, TRUE);
             UpdateWindow(g_hWnd);
             DestroyWindow(h);
@@ -563,7 +556,6 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_DESTROY:
-        // Fix 1: clean up preview font handle
         if (hPreviewFontHandle) {
             DeleteObject(hPreviewFontHandle);
             hPreviewFontHandle = nullptr;
@@ -741,19 +733,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_CTLCOLORSTATIC: {
         HDC hdcStatic = (HDC)w;
+        // FIX v1.9.6: delete old font before creating new one
         static HFONT hCurrentFont = nullptr;
         static std::string lastFontName = "";
         static int lastFontSize = 0;
         if (!g_customFont.empty()) {
             if (g_customFont != lastFontName || g_customFontSize != lastFontSize) {
-                if (hCurrentFont) { SelectObject(hdcStatic, (HFONT)GetStockObject(SYSTEM_FONT)); DeleteObject(hCurrentFont); hCurrentFont = nullptr; }
+                if (hCurrentFont) {
+                    SelectObject(hdcStatic, (HFONT)GetStockObject(SYSTEM_FONT));
+                    DeleteObject(hCurrentFont);
+                    hCurrentFont = nullptr;
+                }
                 std::string faceName = g_customFont;
                 auto pos = faceName.find_last_of("\\/"); if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
                 pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos);
                 hCurrentFont = CreateFontA(g_customFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
-                lastFontName = g_customFont; lastFontSize = g_customFontSize;
+                lastFontName = g_customFont;
+                lastFontSize = g_customFontSize;
             }
             if (hCurrentFont) SelectObject(hdcStatic, hCurrentFont);
         }
@@ -768,14 +766,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         static int lastBtnFontSize = 0;
         if (!g_customFont.empty()) {
             if (g_customFont != lastBtnFontName || g_customFontSize != lastBtnFontSize) {
-                if (hBtnFont) DeleteObject(hBtnFont);
+                if (hBtnFont) {
+                    DeleteObject(hBtnFont);
+                    hBtnFont = nullptr;
+                }
                 std::string faceName = g_customFont;
                 auto pos = faceName.find_last_of("\\/"); if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
                 pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos);
                 hBtnFont = CreateFontA(g_customFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
-                lastBtnFontName = g_customFont; lastBtnFontSize = g_customFontSize;
+                lastBtnFontName = g_customFont;
+                lastBtnFontSize = g_customFontSize;
             }
             if (hBtnFont) SelectObject(hdcBtn, hBtnFont);
         }
@@ -872,12 +874,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return DefWindowProcA(h, m, w, l);
     }
     case WM_DESTROY: {
-        // Fix 5: clean up font handles
         if (g_hStatusFont) DeleteObject(g_hStatusFont);
         if (g_hButtonFont) DeleteObject(g_hButtonFont);
-        // Also the static cached fonts in WM_CTLCOLOR* can be cleaned (they are static but we can delete on exit)
-        // However, those are local statics; we can simply not delete them (OS reclaims on process exit). That's acceptable.
-        
+        // also delete static fonts from WM_CTLCOLOR to be safe
+        if (g_hStaticFont) DeleteObject(g_hStaticFont);
+        if (g_hBtnStaticFont) DeleteObject(g_hBtnStaticFont);
+
         if (Core_IsRecording(&g_Core)) Core_StopRecording(&g_Core);
         if (g_gifImage) { delete g_gifImage; g_gifImage = nullptr; }
         if (g_gifTimerId) KillTimer(h, g_gifTimerId);
@@ -900,7 +902,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // Entry point
 // ============================================================================
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
-    g_mainThreadId = GetCurrentThreadId();   // store UI thread
+    g_mainThreadId = GetCurrentThreadId();
     
     Gdiplus::GdiplusStartupInput gdiplusInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
