@@ -157,15 +157,6 @@ g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 \
 ```
 **⚠️ -D_WIN32_WINNT=0x0A00 is strictly required. Without it, the binary targets XP compatibility and the recording pipeline fails with 0 FPS.**
 
-## Project Tree
-PhantomRec/
-├── src/
-│   ├── PhantomRec.cpp        # C++ UI (Win32 + GDI+)
-│   ├── phantomrec_core.c     # Pure C11 capture engine
-│   └── phantomrec_core.h     # Shared header (extern "C" bridge)
-├── .gitignore
-├── LICENSE
-└── README.md
 ## What PhantomRec Does Not Do (Yet)
 > Streaming — PhantomRec is a recorder, not a streaming tool.
 > Webcam overlay — Not supported.
