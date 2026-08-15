@@ -1,4 +1,4 @@
-// phantomrec_core.h — PhantomRec v1.9.6 Pure C Core
+// phantomrec_core.h — PhantomRec v1.9.7 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 
@@ -96,9 +96,6 @@ typedef struct PhantomRecCore {
     LARGE_INTEGER pauseTime;
     long long totalPausedDurationMs;
 
-    // Power plan
-    GUID originalPowerPlan;
-    int powerPlanChanged;
 
     // Taskbar anchor / game window (reserved)
     HWND g_SelectedGameWnd;
