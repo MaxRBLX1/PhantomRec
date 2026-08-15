@@ -1,8 +1,9 @@
-// PhantomRec.cpp — PhantomRec v1.9.6 C++ UI
+// PhantomRec.cpp — PhantomRec v1.9.7 C++ UI
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | Pure C Core + C++ UI
 // All v1.9.6 fixes applied: font handle cleanup, version bump, minor tweaks.
+// v1.9.7: Removed power plan management, fixed status update flicker, progress bar style.
 
 #include <windows.h>
 #include <shellapi.h>
@@ -12,21 +13,19 @@
 #include <commctrl.h>
 #include <gdiplus.h>
 #include <fstream>
-#include <powrprof.h>
 #include <cstring>
- 
+
 using std::min;
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "powrprof.lib")
 
 extern "C" {
 #include "phantomrec_core.h"
 }
 
-#define PHANTOMREC_VERSION "1.9.6"
+#define PHANTOMREC_VERSION "1.9.7"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -84,10 +83,8 @@ static std::string g_cachedBgPath;
 // Font handles for main window controls (for cleanup)
 static HFONT g_hStatusFont = nullptr;
 static HFONT g_hButtonFont = nullptr;
-
-// FIX v1.9.6: store static font handles from WM_CTLCOLOR to avoid leaks
-static HFONT g_hStaticFont = nullptr;
-static HFONT g_hBtnStaticFont = nullptr;
+static HFONT g_hStaticFont = nullptr;  // for WM_CTLCOLORSTATIC
+static HFONT g_hBtnStaticFont = nullptr; // for WM_CTLCOLORBTN (if needed)
 
 static void UpdateUI();
 static void DoUpdateStatus(const char* message);
@@ -165,20 +162,14 @@ static void OnConversionDone(int success, const char* filePath) {
     }
 }
 
-// Direct UI updaters
+// ============================================================================
+// Direct UI updaters (fixed: no manual black rect, just set text and invalidate)
+// ============================================================================
 static void DoUpdateStatus(const char* message) {
     if (g_lblStatus && IsWindow(g_lblStatus) && g_hWnd) {
-        RECT rect;
-        GetWindowRect(g_lblStatus, &rect);
-        MapWindowPoints(HWND_DESKTOP, g_hWnd, (LPPOINT)&rect, 2);
-        HDC hdc = GetDC(g_hWnd);
-        HBRUSH hBrush = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(hdc, &rect, hBrush);
-        DeleteObject(hBrush);
-        ReleaseDC(g_hWnd, hdc);
         SetWindowTextA(g_lblStatus, message);
-        InvalidateRect(g_hWnd, &rect, TRUE);
-        UpdateWindow(g_hWnd);
+        InvalidateRect(g_lblStatus, nullptr, TRUE);
+        UpdateWindow(g_lblStatus);
     }
 }
 
@@ -238,7 +229,7 @@ static std::string GetHotkeyName(UINT vk) {
 static void CreateDefaultIni() {
     std::ofstream ini(g_iniPath);
     ini << "; ========================================\r\n"
-        << "; PhantomRec v1.9.6 Settings\r\n"
+        << "; PhantomRec v1.9.7 Settings\r\n"
         << "; Made by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ========================================\r\n"
@@ -249,7 +240,7 @@ static void CreateDefaultIni() {
         << ";   auto    = PhantomRec picks the best method for your OS\r\n"
         << ";   ddagrab = DXGI Desktop Duplication (GPU, 60 FPS, Win8+)\r\n"
         << ";   gfx     = D3D11 Graphics Capture (GPU, 60 FPS, Win10+)\r\n"
-        << ";   gdi     = CPU software capture (up to 30 FPS, any Windows)\r\n"  // FIX: corrected FPS
+        << ";   gdi     = CPU software capture (up to 30 FPS, any Windows)\r\n"
         << ";\r\n"
         << "; Hotkey: F1-F12 for function keys\r\n"
         << ";         A-Z for Ctrl+Letter hotkeys (e.g., R = Ctrl+R)\r\n"
@@ -697,7 +688,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 20, 20, 340, 50, h, (HMENU)ID_BTN_RECORD, nullptr, nullptr);
         CreateWindowA("BUTTON", "", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 360, 5, 30, 30, h, (HMENU)ID_BTN_SETTINGS, nullptr, nullptr);
         g_lblStatus = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFT, 20, 120, 340, 130, h, nullptr, nullptr, nullptr);
-        g_progressBar = CreateWindowA("msctls_progress32", "", WS_VISIBLE | WS_CHILD | PBS_MARQUEE, 20, 260, 340, 15, h, nullptr, nullptr, nullptr);
+        // Fixed: removed PBS_MARQUEE style – now it correctly shows progress position
+        g_progressBar = CreateWindowA("msctls_progress32", "", WS_VISIBLE | WS_CHILD, 20, 260, 340, 15, h, nullptr, nullptr, nullptr);
+        SendMessageA(g_progressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
         UINT recMod = GetHotkeyModifiers(g_recordHotkey); RegisterHotKey(h, ID_HOTKEY_RECORD, recMod, g_recordHotkey);
         UINT pauseMod = GetHotkeyModifiers(g_pauseHotkey); RegisterHotKey(h, ID_HOTKEY_PAUSE, pauseMod, g_pauseHotkey);
         SetTimer(h, ID_TIMER_INI_CHECK, 2000, nullptr);
@@ -781,6 +774,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             if (hBtnFont) SelectObject(hdcBtn, hBtnFont);
         }
+        // return 0 lets the system paint the button
         return 0;
     }
     case WM_PAINT: {
@@ -876,7 +870,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY: {
         if (g_hStatusFont) DeleteObject(g_hStatusFont);
         if (g_hButtonFont) DeleteObject(g_hButtonFont);
-        // also delete static fonts from WM_CTLCOLOR to be safe
         if (g_hStaticFont) DeleteObject(g_hStaticFont);
         if (g_hBtnStaticFont) DeleteObject(g_hBtnStaticFont);
 
@@ -887,10 +880,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         UnregisterHotKey(h, ID_HOTKEY_RECORD);
         UnregisterHotKey(h, ID_HOTKEY_PAUSE);
         KillTimer(h, ID_TIMER_INI_CHECK);
-        if (g_Core.powerPlanChanged) {
-            PowerSetActiveScheme(NULL, &g_Core.originalPowerPlan);
-            g_Core.powerPlanChanged = 0;
-        }
+        // Power plan management removed – nothing to restore.
         PostQuitMessage(0);
         return 0;
     }
@@ -907,17 +897,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     Gdiplus::GdiplusStartupInput gdiplusInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
     
-    // LOCK HIGH PERFORMANCE AT LAUNCH
-    {
-        GUID highPerf = {0x8c5e7fda, 0xe8bf, 0x4a96, {0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c}};
-        GUID* pOriginalGuid = NULL;
-        if (PowerGetActiveScheme(NULL, &pOriginalGuid) == ERROR_SUCCESS) {
-            g_Core.originalPowerPlan = *pOriginalGuid;
-            LocalFree(pOriginalGuid);
-            PowerSetActiveScheme(NULL, &highPerf);
-            g_Core.powerPlanChanged = 1;
-        }
-    }
+    // Power plan management removed entirely.
     
     g_outputDir = GetVideosFolder();
     g_iniPath = GetExeDir() + "\\Settings.ini";
