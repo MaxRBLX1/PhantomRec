@@ -1,7 +1,8 @@
-// phantomrec_core.c — PhantomRec v1.9.6 Pure C Core
+// phantomrec_core.c — PhantomRec v1.9.7 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// Direct FFmpeg launch (no cmd.exe wrapper) for full control.
+// Direct FFmpeg launch with ffvhuff + YUV420P + single-thread + fast Stage 2
+// Power plan management removed as requested.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -11,7 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <powrprof.h>
 #include <avrt.h>
 #include <process.h>
 #include <initguid.h>
@@ -21,7 +21,6 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "avrt.lib")
-#pragma comment(lib, "powrprof.lib")
 
 // ============================================================================
 // Internal helpers
@@ -82,14 +81,12 @@ static void StopFFmpegProcess(PhantomRecCore* core, DWORD timeoutMs) {
     DWORD pid = core->ffmpegProcess.dwProcessId;
     HANDLE hProcess = core->ffmpegProcess.hProcess;
 
-    // Step 1: Attach and send CTRL_BREAK
     if (AttachConsole(pid)) {
         GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
         Sleep(timeoutMs);
         FreeConsole();
     }
 
-    // Step 2: If still alive, try CTRL_C
     DWORD exitCode;
     if (GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE) {
         if (AttachConsole(pid)) {
@@ -99,13 +96,11 @@ static void StopFFmpegProcess(PhantomRecCore* core, DWORD timeoutMs) {
         }
     }
 
-    // Step 3: Still alive? Terminate.
     if (GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE) {
         TerminateProcess(hProcess, 0);
         WaitForSingleObject(hProcess, 1000);
     }
 
-    // Step 4: Close handles
     CloseHandle(hProcess);
     CloseHandle(core->ffmpegProcess.hThread);
     memset(&core->ffmpegProcess, 0, sizeof(core->ffmpegProcess));
@@ -238,7 +233,7 @@ int Core_FindMaxsEngine(PhantomRecCore* core) {
 }
 
 // ============================================================================
-// WASAPI Audio Capture
+// WASAPI Audio Capture (unchanged)
 // ============================================================================
 
 static int InitializeWASAPI(PhantomRecCore* core) {
@@ -310,7 +305,7 @@ static void CleanupWASAPI(PhantomRecCore* core) {
 }
 
 // ============================================================================
-// Audio capture thread
+// Audio capture thread (unchanged)
 // ============================================================================
 
 static unsigned int __stdcall AudioToPipeThread(void* param) {
@@ -369,13 +364,12 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
     GetCaptureInput(core, captureInput, sizeof(captureInput));
     GetCaptureFilter(core, captureFilter, sizeof(captureFilter));
     const char* rtbufsize = "2048M";
-    int encoderSlices = (core->cpuCoreCount <= 2) ? 1 : core->cpuCoreCount;
-    if (encoderSlices < 1) encoderSlices = 1;
-    core->dynamicThreads = encoderSlices;
+
+    // Single-threaded encoding - no game core contention
+    core->dynamicThreads = 1;
 
     int vq = (core->videoQueueSize > 0) ? core->videoQueueSize : 4096;
 
-    // Start with the executable path (quoted)
     int offset = sprintf_s(cmdLine, cmdSize,
         "\"%s\" -y -hide_banner -loglevel error"
         " -rtbufsize %s"
@@ -391,16 +385,15 @@ static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, in
 
     offset += sprintf_s(cmdLine + offset, cmdSize - offset,
         "%s"
-        " -max_muxing_queue_size 50000"
-        " -c:v utvideo -pred median -slices %d"
-        " -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
-        captureFilter, encoderSlices);
+        " -fps_mode passthrough"
+        " -max_muxing_queue_size 2147483647"
+        " -c:v ffvhuff -pred left -threads 1 -pix_fmt yuv420p",
+        captureFilter);
 
     if (hasAudio) {
         offset += sprintf_s(cmdLine + offset, cmdSize - offset, " -c:a copy");
     }
 
-    // Output file (quoted)
     sprintf_s(cmdLine + offset, cmdSize - offset,
         " -fflags +genpts -f matroska \"%s\"",
         outputFile);
@@ -463,17 +456,15 @@ void Core_SetCaptureMethod(PhantomRecCore* core) {
 void Core_WarmEngine(PhantomRecCore* core) {
     char captureInput[512];
     GetCaptureInput(core, captureInput, sizeof(captureInput));
-    int warmupSlices = (core->cpuCoreCount <= 2) ? 1 : core->cpuCoreCount; // Dual-core optimization
-    if (warmupSlices < 1) warmupSlices = 1;
     char warmupCmd[1024];
     if (core->captureMethod <= 1) {
         sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "\"%s\" -y -hide_banner -loglevel error %s -frames:v 3 -c:v utvideo -pred median -slices %d -f null NUL",
-            core->maxsenginePath, captureInput, warmupSlices);
+            "\"%s\" -y -hide_banner -loglevel error %s -vf \"hwdownload,format=bgra,format=yuv420p\" -frames:v 3 -c:v ffvhuff -pred left -threads 1 -pix_fmt yuv420p -f null NUL",
+            core->maxsenginePath, captureInput);
     } else {
         sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "\"%s\" -y -hide_banner -loglevel error -f gdigrab -framerate 60 -i desktop -frames:v 3 -c:v utvideo -pred median -slices %d -f null NUL",
-            core->maxsenginePath, warmupSlices);
+            "\"%s\" -y -hide_banner -loglevel error -f gdigrab -framerate 60 -i desktop -vf \"format=yuv420p\" -frames:v 3 -c:v ffvhuff -pred left -threads 1 -pix_fmt yuv420p -f null NUL",
+            core->maxsenginePath);
     }
     STARTUPINFOA si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -503,8 +494,14 @@ void Core_CleanupOrphanedTempFiles(PhantomRecCore* core) {
     }
 }
 
+// ============================================================================
+// Core Shutdown - now does nothing (power plan management removed)
+// ============================================================================
+
 void Core_Shutdown(PhantomRecCore* core) {
-    // stub – cleanup handled in WinMain
+    // Power plan management has been removed.
+    // This function is kept as a stub to avoid breaking any existing calls.
+    (void)core;
 }
 
 // ============================================================================
@@ -514,17 +511,6 @@ void Core_Shutdown(PhantomRecCore* core) {
 int Core_StartRecording(PhantomRecCore* core) {
     if (InterlockedCompareExchange(&core->recording, 1, 1) == 1) return 0;
     if (InterlockedCompareExchange(&core->converting, 1, 1) == 1) return 0;
-
-    if (!core->powerPlanChanged) {
-        GUID highPerf = {0x8c5e7fda, 0xe8bf, 0x4a96, {0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c}};
-        GUID* pOriginalGuid = NULL;
-        if (PowerGetActiveScheme(NULL, &pOriginalGuid) == ERROR_SUCCESS) {
-            core->originalPowerPlan = *pOriginalGuid;
-            LocalFree(pOriginalGuid);
-            PowerSetActiveScheme(NULL, &highPerf);
-            core->powerPlanChanged = 1;
-        }
-    }
 
     char ts[64];
     Core_Timestamp(ts, sizeof(ts));
@@ -579,6 +565,12 @@ int Core_StartRecording(PhantomRecCore* core) {
     if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
         CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
         NULL, NULL, &si, &core->ffmpegProcess)) {
+        DWORD err = GetLastError();
+        if (core->onStatusUpdate) {
+            char msg[128];
+            sprintf_s(msg, sizeof(msg), "CreateProcess failed with error %lu", err);
+            core->onStatusUpdate(msg);
+        }
         InterlockedExchange(&core->recording, 0);
         if (core->hAudioStartEvent) {
             SetEvent(core->hAudioStartEvent);
@@ -628,11 +620,6 @@ void Core_StopRecording(PhantomRecCore* core) {
     InterlockedExchange(&core->recording, 0);
     InterlockedExchange(&core->paused, 0);
 
-    if (core->powerPlanChanged) {
-        PowerSetActiveScheme(NULL, &core->originalPowerPlan);
-        core->powerPlanChanged = 0;
-    }
-
     // Close pipe write BEFORE waiting for audio thread
     if (core->hAudioPipeWrite) {
         CloseHandle(core->hAudioPipeWrite);
@@ -648,10 +635,8 @@ void Core_StopRecording(PhantomRecCore* core) {
 
     // Save PID before stopping FFmpeg (will be zeroed)
     DWORD pid = core->ffmpegProcess.dwProcessId;
-    // Stop FFmpeg (2 seconds timeout)
     StopFFmpegProcess(core, 2000);
 
-    // Close the console window that FFmpeg was running in
     if (pid) {
         CloseConsoleWindow(pid);
     }
@@ -684,7 +669,6 @@ void Core_StopRecording(PhantomRecCore* core) {
     sprintf_s(losslessFile, MAX_PATH, "%s\\%s_lossless.mkv", core->outputDir, core->segmentBaseName);
 
     char concatCmd[8196];
-    // Concatenation – we still use cmd for simplicity, but it's a one‑time operation.
     sprintf_s(concatCmd, sizeof(concatCmd),
         "cmd.exe /c \"\"%s\" -y -loglevel error -f concat -safe 0 -i \"%s\" -c copy \"%s\"\"",
         core->maxsenginePath, segmentsTxt, losslessFile);
@@ -708,7 +692,7 @@ void Core_StopRecording(PhantomRecCore* core) {
         return;
     }
 
-    // Now decide: compress or keep lossless?
+    // Stage 2: compress to MP4
     if (core->convertAfterRecording && core->lastRecordingDurationMs >= 1000) {
         InterlockedExchange(&core->converting, 1);
         core->convertProgress = 0;
@@ -716,11 +700,12 @@ void Core_StopRecording(PhantomRecCore* core) {
         if (core->onButtonUpdate) core->onButtonUpdate("Processing...");
 
         char cmdLine[8196];
-        // Compression – directly launch FFmpeg
         sprintf_s(cmdLine, sizeof(cmdLine),
             "\"%s\" -y -progress pipe:1 -loglevel error -i \"%s\" "
-            "-c:v libx264 -preset ultrafast -crf %d -c:a aac -b:a 128k -async 1 "
-            "-pix_fmt yuv420p -r 60 -fps_mode cfr \"%s\"",
+            "-c:v libx264 -preset veryfast -crf %d "
+            "-c:a aac -b:a 96k -af aresample=async=1 "
+            "-pix_fmt yuv420p -r 60 -fps_mode cfr "
+            "-movflags +faststart \"%s\"",
             core->maxsenginePath, losslessFile, core->crf, core->finalFile);
 
         HANDLE hRead, hWrite;
@@ -827,16 +812,13 @@ void Core_TogglePause(PhantomRecCore* core) {
 
         // Save PID before stopping FFmpeg
         DWORD pid = core->ffmpegProcess.dwProcessId;
-        // Stop FFmpeg with a short 500ms timeout
         StopFFmpegProcess(core, 500);
-        // Close the console window
         if (pid) {
             CloseConsoleWindow(pid);
         }
 
         if (core->onStatusUpdate) core->onStatusUpdate("PAUSED");
         if (core->onButtonUpdate) core->onButtonUpdate("RESUME");
-
     } else {
         // Resume
         LARGE_INTEGER now;
@@ -883,7 +865,6 @@ void Core_TogglePause(PhantomRecCore* core) {
         if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
             CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
             NULL, NULL, &si, &core->ffmpegProcess)) {
-            // Resume failed – stop entirely
             InterlockedExchange(&core->recording, 0);
             InterlockedExchange(&core->paused, 0);
 
@@ -903,11 +884,6 @@ void Core_TogglePause(PhantomRecCore* core) {
                 core->hAudioPipeWrite = NULL;
             }
             CleanupWASAPI(core);
-
-            if (core->powerPlanChanged) {
-                PowerSetActiveScheme(NULL, &core->originalPowerPlan);
-                core->powerPlanChanged = 0;
-            }
 
             if (core->onStatusUpdate) core->onStatusUpdate("Resume failed – recording stopped");
             if (core->onButtonUpdate) core->onButtonUpdate("START");
@@ -931,7 +907,7 @@ void Core_TogglePause(PhantomRecCore* core) {
 }
 
 // ============================================================================
-// Status queries (use Interlocked to read)
+// Status queries
 // ============================================================================
 
 int Core_IsRecording(const PhantomRecCore* core) {
