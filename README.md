@@ -1,5 +1,7 @@
 # PhantomRec — "Record with lightweight compression now. Encode with heavy compression later."
 
+<img width="256" height="256" alt="Untitled" src="https://github.com/user-attachments/assets/9dec6e78-d9d8-4e4f-a491-fe130d9bc978" />  *The Icon Resambles M for MaxRBLX1*
+
 **Built by MaxRBLX1 — v1.9.7**
 
 ## Project History
@@ -35,11 +37,12 @@ All capture methods write a lossless master file at the native frame rate. The f
 
 ## Why Choose PhantomRec?
 
-PhantomRec uses a two‑stage ghost pipeline — the same architecture that made Fraps legendary, rebuilt for modern lossless codecs.
+PhantomRec uses a two‑stage ghost pipeline — this is new for some recorders
 
-### Stage 1 — Live Capture (Ut Video lossless, ~5% CPU)
 
-The screen is captured and encoded with Ut Video — a mathematically lossless, intra‑frame codec.
+### Stage 1 — Live Capture (ffvhuff lossless, ~5% CPU)
+
+The screen is captured and encoded with ffvhuff — a mathematically lossless, intra‑frame codec.
 
 - **Parallel encoding:** uses `-slices` equal to your CPU core count (1 slice for dual‑core systems to avoid thread trashing), keeping CPU usage flat at ~5% regardless of on‑screen action.
 - **Duplicate frames** are skipped automatically.
@@ -110,37 +113,25 @@ FontColor=16777215
 | `ConvertAfterRecording` | `yes` = automatically compress after recording (recommended).<br>`no` = keep the raw segment files (`*_segN_temp.mkv` + `segments.txt`) in the output folder. You must manually concatenate or delete them. |
 | `CaptureMethod` | `auto` (default), `gfx`, `ddagrab`, `gdi`. |
 
-## ⚠️ Important: When ConvertAfterRecording=no
+## ⚠️ Important: When `ConvertAfterRecording=no`
 
-PhantomRec does not concatenate or delete the segment files. Instead, it leaves:
+When `ConvertAfterRecording=no`, PhantomRec **keeps the lossless master file** instead of compressing it to x264.
 
-- Multiple `*_segN_temp.mkv` files (each is a lossless chunk of your recording)
-- A `segments.txt` file that lists these chunks in the correct order
+| Setting | Result |
+| :--- | :--- |
+| `ConvertAfterRecording=yes` | Lossless capture (`ffvhuff`) → compressed to x264 → lossless file deleted. Final file: small, shareable. |
+| `ConvertAfterRecording=no` | Lossless capture (`ffvhuff`) → lossless file kept. Final file: large, perfect quality. |
 
-To turn these chunks into a single playable video, you must manually concatenate them using `maxsengine.exe` (the included FFmpeg build).
+### File Output
 
-## How to Concatenate Manually
+- **`yes` (default):** `PhantomRec_YYYYMMDD_HHMMSS.mkv` – compact x264, ready to share.
+- **`no`:** `PhantomRec_YYYYMMDD_HHMMSS_lossless.mkv` – lossless ffvhuff, ideal for editing or re‑encoding later.
 
-1. Open the folder where PhantomRec saves your recordings.
-   (Default: `C:\Users\[YourUsername]\Videos\PhantomRec`)
+> 💡 **Tip:** The lossless file is mathematically identical to what was captured. Use it if you plan to edit or re‑encode later. For everyday sharing, the compressed file is best.
 
-2. In that folder, locate the `segments.txt` file and all the `*_segN_temp.mkv` files.
+### No Manual Work Needed
 
-3. Open Command Prompt in that exact folder:
-   - Hold Shift + right‑click inside the folder window.
-   - Select "Open PowerShell window here" or "Open command window here".
-   - (Alternatively, type `cmd` in the folder's address bar and press Enter.)
-
-4. Run this command:
-
-```
-maxsengine.exe -f concat -safe 0 -i segments.txt -c copy output.mkv
-```
-5. Wait for the process to finish. You'll now have a single file named `output.mkv` — this is your complete recording.
-
-6. You can safely delete the `*_segN_temp.mkv` files and `segments.txt` to free up space.
-
-💡 **Tip:** Rename `output.mkv` to something meaningful (e.g., `my_gameplay.mkv`) before moving or sharing it.
+PhantomRec **automatically concatenates all segments** into a single file – you never need to manually merge segments or delete temporary files.
 
 ## Building from Source
 
