@@ -26,13 +26,19 @@ PhantomRec uses a **two-stage pipeline** that keeps your GPU 100% focused on you
 
 ### Future: Game Capture via Hooking
 
-For **exclusive fullscreen games**, PhantomRec will eventually capture raw frames by hooking the game's `Present()` call. This bypasses DWM entirely – zero added latency, zero FPS drop, perfect for all games.
+For **exclusive fullscreen games**, PhantomRec will eventually capture raw frames by hooking the game's `Present()` call. This bypasses the Desktop Window Manager (DWM) entirely – **zero added latency, zero FPS drop**, and perfect frame pacing for every game, from retro classics to modern AAA titles.
+
+- **No DWM overhead** – the game talks directly to the display.
+- **No added input lag** – the hook never blocks the render loop.
+- **Works on all APIs** – DirectX 9, 10, 11, 12, OpenGL, Vulkan (via runtime detection, no hardcoding).
+- **Legacy support** – DirectX 7/8 games captured via wrapper libraries (e.g., `d3d8to9`).
 
 ### The Result
 
 - GPU stays 100% dedicated to your game.
 - Recording uses ~5% CPU on any hardware.
 - No GPU encoder required – works on any PC from 2008 onward.
+- **Future:** Universal game capture for every exclusive fullscreen title, old or new.
 
 ## What is PhantomRec?
 
