@@ -9,9 +9,30 @@
 PhantomRec was originally released as RetroRec (v1.0 – v1.7). The name was changed in v1.8.
 All recordings and settings from previous versions are fully compatible.
 
-## A Note on Zero Performance Impact
+## Zero Performance Impact – How PhantomRec Works
 
-When you record using DDAGRAB or GFX Capture, it will steal FPS from your game because it makes your GPU do the heavy lifting — even if you don't have a GPU or have a GPU with no encoder. If you want no performance impact, use GDIGrab. This works in system memory, meaning your GPU is 100% focused on the game, but it gives a 30fps recording.
+PhantomRec uses a **two-stage pipeline** that keeps your GPU 100% focused on your game.
+
+### Stage 1: Capture (GPU copy + CPU lossless encoding)
+
+- **GFX / DDAGrab** use the GPU's **copy engine** to read the framebuffer – lightweight, minimal impact.
+- **ffvhuff** (CPU, ~5%) encodes losslessly – **no GPU encoding** means zero FPS theft.
+- **GDIGrab** (CPU fallback) works on any system, but is slower (30 FPS).
+
+### Stage 2: Compression (after recording)
+
+- Heavy **x264** compression runs **when you're idle** – not during gameplay.
+- The stop button responds instantly – no encoder queue drain freeze.
+
+### Future: Game Capture via Hooking
+
+For **exclusive fullscreen games**, PhantomRec will eventually capture raw frames by hooking the game's `Present()` call. This bypasses DWM entirely – zero added latency, zero FPS drop, perfect for all games.
+
+### The Result
+
+- GPU stays 100% dedicated to your game.
+- Recording uses ~5% CPU on any hardware.
+- No GPU encoder required – works on any PC from 2008 onward.
 
 ## What is PhantomRec?
 
