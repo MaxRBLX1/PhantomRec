@@ -57,8 +57,8 @@ PhantomRec is designed to work on **any PC** — no exceptions, no lockouts
 | :--- | :--- | :--- |
 | **NVIDIA Kepler+ (GTX 600+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
 | **AMD GCN 1.0+ (HD 7000+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
-| **NVIDIA Tesla/Fermi (GTX 400/500)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern games smoothly. Recording still works via GDI fallback. | ❌ No |
-| **AMD TeraScale (HD 6000 or older)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern games smoothly. Recording still works via GDI fallback. | ❌ No |
+| **NVIDIA Tesla/Fermi (GTX 400/500)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern API that phantomrec uses properly. Recording still works via GDI fallback. | ❌ No |
+| **AMD TeraScale (HD 6000 or older)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern modern API that phantomrec uses properly. Recording still works via GDI fallback. | ❌ No |
 | **No GPU (Microsoft Basic Display Adapter)** | ✅ PhantomRec uses GDI + CPU encoding. Recording is still smooth. | ❌ No |
 
 ---
