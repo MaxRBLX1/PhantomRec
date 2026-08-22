@@ -45,7 +45,7 @@ For **exclusive fullscreen games**, PhantomRec will eventually capture raw frame
 PhantomRec is designed to work on **any PC** — no exceptions, no lockouts
 - CPU: Any 64-bit CPU
 - GPU: **Kepler** or newer (Tesla and fermi works but games will lag) for AMD **AMD GCN 1.0+** or newer (AMD TeraScale HD 6000 or older works but games will lag)
-- RAM: 4 GB minimum
+- RAM: 4 GB minimum because of thread queue size 4096
 - OS: Windows Vista to Windows 11
 - Storage: Any HDD or SSD
 
