@@ -40,6 +40,61 @@ For **exclusive fullscreen games**, PhantomRec will eventually capture raw frame
 - No GPU encoder required – works on any PC from 2008 onward.
 - **Future:** Universal game capture for every exclusive fullscreen title, old or new.
 
+## System Requirements
+
+PhantomRec is designed to work on **any PC** — no exceptions, no lockouts
+- CPU: Any 64-bit CPU
+- GPU: **Kepler** or newer (Tesla and fermi works but games will lag) for AMD **AMD GCN 1.0+** or newer (AMD TeraScale HD 6000 or older works but games will lag)
+- RAM: 4 GB minimum
+- OS: Windows Vista to Windows 11
+- Storage: Any HDD or SSD
+
+---
+
+### What This Means for Your GPU
+
+| GPU Type | What Happens | Locked Out? |
+| :--- | :--- | :--- |
+| **NVIDIA Kepler+ (GTX 600+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
+| **AMD GCN 1.0+ (HD 7000+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
+| **NVIDIA Tesla/Fermi (GTX 400/500)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern games smoothly. Recording still works via GDI fallback. | ❌ No |
+| **AMD TeraScale (HD 6000 or older)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern games smoothly. Recording still works via GDI fallback. | ❌ No |
+| **No GPU (Microsoft Basic Display Adapter)** | ✅ PhantomRec uses GDI + CPU encoding. Recording is still smooth. | ❌ No |
+
+---
+
+### The Honest Explanation
+
+> **All GPUs work with PhantomRec — no one is locked out.**
+
+- **If you have a modern GPU** (NVIDIA Kepler+, AMD GCN 1.0+), you get **60 FPS** recording with DDAGrab/GFX. These APIs are fast and efficient.
+
+- **If you have an older GPU** (NVIDIA Tesla/Fermi, AMD TeraScale), PhantomRec **still uses all capture APIs** — but your games will lag because the GPU itself is too old to run modern games smoothly. **Recording still works** via GDI fallback.
+
+- **If you have no GPU** (Microsoft Basic Display Adapter), PhantomRec uses **GDI + CPU encoding**. Recording is still smooth.
+
+---
+
+### Why These Requirements?
+
+| Requirement | Why It's There |
+| :--- | :--- |
+| **Any 64-bit CPU** | PhantomRec uses the CPU for encoding — not the GPU. No special instructions required. |
+| **Kepler or newer GPU** | Kepler and GCN 1.0 are the baseline for modern APIs like DDAGrab/GFX. Older GPUs (Tesla/Fermi/TeraScale) still work, but modern games will lag because the hardware is too old. |
+| **4 GB RAM** | PhantomRec uses large thread queues (`4096`) to absorb HDD write pauses. You need enough memory to buffer frames and audio. |
+| **Windows Vista to 11** | GDI capture works on all Windows versions from Vista onward. GFX and DDAGrab work on newer versions. |
+| **Any HDD or SSD** | The pipeline is designed to handle slow mechanical drives. You don't need an SSD to record smoothly. |
+
+---
+
+### No Minimum. No Maximum. No Lockouts.
+
+PhantomRec works on **what you already have**.
+
+- No expensive GPU required.
+- No forced upgrades.
+- No artificial limits.
+
 ## What is PhantomRec?
 
 PhantomRec is a free, portable, invisible screen recorder for Windows.
