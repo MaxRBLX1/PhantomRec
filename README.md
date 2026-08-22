@@ -1,6 +1,6 @@
 # PhantomRec — "Record with lightweight compression now. Encode with heavy compression later."
 
-<img width="256" height="256" alt="Untitled" src="https://github.com/user-attachments/assets/9dec6e78-d9d8-4e4f-a491-fe130d9bc978" />  *The Icon Resambles M for MaxRBLX1*
+<img width="256" height="256" alt="Untitled" src="https://github.com/user-attachments/assets/9dec6e78-d9d8-4e4f-a491-fe130d9bc978" />  *The Icon Resembles "M" for MaxRBLX1*
 
 **Built by MaxRBLX1 — v1.9.7**
 
@@ -57,8 +57,8 @@ PhantomRec is designed to work on **any PC** — no exceptions, no lockouts
 | :--- | :--- | :--- |
 | **NVIDIA Kepler+ (GTX 600+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
 | **AMD GCN 1.0+ (HD 7000+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
-| **NVIDIA Tesla/Fermi (GTX 400/500)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern API that phantomrec uses properly. Recording still works via GDI fallback. | ❌ No |
-| **AMD TeraScale (HD 6000 or older)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern modern API that phantomrec uses properly. Recording still works via GDI fallback. | ❌ No |
+| **NVIDIA Tesla/Fermi (GTX 400/500)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern API that PhantomRec uses properly. Recording still works via GDI fallback. | ❌ No |
+| **AMD TeraScale (HD 6000 or older)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern modern API that PhantomRec uses properly. Recording still works via GDI fallback. | ❌ No |
 | **No GPU (Microsoft Basic Display Adapter)** | ✅ PhantomRec uses GDI + CPU encoding. Recording is still smooth. | ❌ No |
 
 ---
@@ -69,7 +69,7 @@ PhantomRec is designed to work on **any PC** — no exceptions, no lockouts
 
 - **If you have a modern GPU** (NVIDIA Kepler+, AMD GCN 1.0+), you get **60 FPS** recording with DDAGrab/GFX. These APIs are fast and efficient.
 
-- **If you have an older GPU** (NVIDIA Tesla/Fermi, AMD TeraScale), PhantomRec **still uses all capture APIs** — but your games will lag because the GPU itself is too old to run modern games smoothly. **Recording still works** via GDI fallback.
+- **If you have an older GPU** (NVIDIA Tesla/Fermi, AMD TeraScale), PhantomRec **still uses all capture APIs** but your games will lag because the GPU itself is too old to run the modern APIs that PhantomRec uses properly. Recording still works via GDI fallback. If you experience lag while using GDI, your CPU is the bottleneck, not the GPU.
 
 - **If you have no GPU** (Microsoft Basic Display Adapter), PhantomRec uses **GDI + CPU encoding**. Recording is still smooth.
 
