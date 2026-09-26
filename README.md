@@ -2,185 +2,166 @@
 
 <img width="256" height="256" alt="Untitled" src="https://github.com/user-attachments/assets/9dec6e78-d9d8-4e4f-a491-fe130d9bc978" />  *The Icon Resembles "M" for MaxRBLX1*
 
-**Built by MaxRBLX1 — v1.9.7**
+**Built by MaxRBLX1 — v1.9.8**
 
 ## Project History
 
 PhantomRec was originally released as RetroRec (v1.0 – v1.7). The name was changed in v1.8.
 All recordings and settings from previous versions are fully compatible.
 
-## Zero Performance Impact – How PhantomRec Works
-
-PhantomRec uses a **two-stage pipeline** that keeps your GPU 100% focused on your game.
-
-### Stage 1: Capture (GPU copy + CPU lossless encoding)
-
-- **GFX / DDAGrab** use the GPU's **copy engine** to read the framebuffer – lightweight, minimal impact.
-- **ffvhuff** (CPU, ~5%) encodes losslessly – **no GPU encoding** means zero FPS theft.
-- **GDIGrab** (CPU fallback) works on any system, but is slower (30 FPS).
-
-### Stage 2: Compression (after recording)
-
-- Heavy **x264** compression runs **when you're idle** – not during gameplay.
-- The stop button responds instantly – no encoder queue drain freeze.
-
-### Future: Game Capture via Hooking
-
-For **exclusive fullscreen games**, PhantomRec will eventually capture raw frames by hooking the game's `Present()` call. This bypasses the Desktop Window Manager (DWM) entirely – **zero added latency, zero FPS drop**, and perfect frame pacing for every game, from retro classics to modern AAA titles.
-
-- **No DWM overhead** – the game talks directly to the display.
-- **No added input lag** – the hook never blocks the render loop.
-- **Works on all APIs** – DirectX 9, 10, 11, 12, OpenGL, Vulkan (via runtime detection, no hardcoding).
-- **Legacy support** – DirectX 7/8 games captured via wrapper libraries (e.g., `d3d8to9`).
-
-### The Result
-
-- GPU stays 100% dedicated to your game.
-- Recording uses ~5% CPU on any hardware.
-- No GPU encoder required – works on any PC from 2008 onward.
-- **Future:** Universal game capture for every exclusive fullscreen title, old or new.
-
-## System Requirements
-
-PhantomRec is designed to work on **any PC** — no exceptions, no lockouts
-- CPU: Any 64-bit CPU
-- GPU: **Kepler** or newer (Tesla and fermi works but games will lag) for AMD **AMD GCN 1.0+** or newer (AMD TeraScale HD 6000 or older works but games will lag)
-- RAM: 4 GB minimum because of thread queue size 4096
-- OS: Windows Vista to Windows 11
-- Storage: Any HDD or SSD
-
 ---
-
-### What This Means for Your GPU
-
-| GPU Type | What Happens | Locked Out? |
-| :--- | :--- | :--- |
-| **NVIDIA Kepler+ (GTX 600+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
-| **AMD GCN 1.0+ (HD 7000+)** | ✅ Full DDAGrab/GFX support. 60 FPS recording. | ❌ No |
-| **NVIDIA Tesla/Fermi (GTX 400/500)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern API that PhantomRec uses properly. Recording still works via GDI fallback. | ❌ No |
-| **AMD TeraScale (HD 6000 or older)** | ⚠️ All APIs work, but games will lag because the GPU itself is too old to run modern modern API that PhantomRec uses properly. Recording still works via GDI fallback. | ❌ No |
-| **No GPU (Microsoft Basic Display Adapter)** | ✅ PhantomRec uses GDI + CPU encoding. Recording is still smooth. | ❌ No |
-
----
-
-### The Honest Explanation
-
-> **All GPUs work with PhantomRec — no one is locked out.**
-
-- **If you have a modern GPU** (NVIDIA Kepler+, AMD GCN 1.0+), you get **60 FPS** recording with DDAGrab/GFX. These APIs are fast and efficient.
-
-- **If you have an older GPU** (NVIDIA Tesla/Fermi, AMD TeraScale), PhantomRec **still uses all capture APIs (including DDAGrab and GFX)** but your games will lag because the GPU itself is too old to run the modern APIs that PhantomRec uses properly. The capture APIs work, but the GPU struggles with modern DirectX/OpenGL calls, causing game lag. Recording still works via GDI fallback. If you experience lag while using GDI, your CPU is the bottleneck, not the GPU.
-
-- **If you have no GPU** (Microsoft Basic Display Adapter), PhantomRec uses **GDI + CPU encoding**. Recording is still smooth.
-
----
-
-### Why These Requirements?
-
-| Requirement | Why It's There |
-| :--- | :--- |
-| **Any 64-bit CPU** | PhantomRec uses the CPU for encoding — not the GPU. No special instructions required. |
-| **Kepler or newer GPU** | Kepler and GCN 1.0 are the baseline for modern APIs like DDAGrab/GFX. Older GPUs (Tesla/Fermi/TeraScale) still work, but modern games will lag because the hardware is too old. |
-| **4 GB RAM** | PhantomRec uses large thread queues (`4096`) to absorb HDD write pauses. You need enough memory to buffer frames and audio. |
-| **Windows Vista to 11** | GDI capture works on all Windows versions from Vista onward. GFX and DDAGrab work on newer versions. |
-| **Any HDD or SSD** | The pipeline is designed to handle slow mechanical drives. You don't need an SSD to record smoothly. |
-
----
-
-### No Minimum. No Maximum. No Lockouts.
-
-PhantomRec works on **what you already have**.
-
-- No expensive GPU required.
-- No forced upgrades.
-- No artificial limits.
 
 ## What is PhantomRec?
 
 PhantomRec is a free, portable, invisible screen recorder for Windows.
-It captures your desktop at a smooth 60 FPS with system audio, then converts the recording into a compact, high‑quality file.
+It captures your desktop with system audio, then converts the recording into a compact, high-quality file after you stop.
 
 No GPU? No problem. Old laptop? It works.
-PhantomRec runs on any Windows PC from Vista to Windows 11, from a dual‑core budget machine to a high‑end workstation.
+PhantomRec runs on Windows 7 SP1 through Windows 11, from a dual-core budget machine to a high-end workstation.
+
+The design principle is simple: **the GPU belongs to the game, not the recorder.** PhantomRec never calls NVENC, AMF, or QuickSync. Encoding happens on the CPU, which leaves the GPU encoder graph flat at 0% while you record.
+
+---
+
+## How PhantomRec Works — The Two-Stage Ghost Pipeline
+
+### Stage 1 — Live Capture (MJPEG, CPU-only)
+
+- **GFX Capture / DDAGrab** use the GPU's copy engine to read the framebuffer, then hand the raw pixels to the CPU. One blit per frame, no GPU-side format conversion.
+- **MaxRBLX1's Fastest MJPEG** (`maxenc.exe`) encodes each frame with **libjpeg-turbo** (SIMD-accelerated JPEG) using a single thread on a pinned CPU core. This is a high-quality intermediate, not a lossless master.
+- **GDI fallback** works on any Windows version and any GPU — including Microsoft Basic Display Adapter — at up to 30 FPS.
+- The GPU encoder graph stays at **0%** because PhantomRec never touches it.
+
+Every frame is timestamped with a wall-clock PTS from `QueryPerformanceCounter`, not a frame counter. That means the timing stays correct even when the capture source doesn't deliver exactly N frames per second — which it never does, especially during the first seconds of startup.
+
+Encoded frames are handed to a **bounded writer ring** (64 slots). A separate thread muxes them to disk. A short disk stall — Defender scanning the growing file, an HDD seek, SMB latency — cannot blow the frame budget. On overflow, the oldest queued frame is dropped, which is the right policy for a screen recorder.
+
+**Audio** is captured separately by `maxsound.exe` using WASAPI loopback. Video and audio each write a `.t0` marker file with the QPC tick at their first sample. At mux time, PhantomRec reads both markers and offsets the audio track by the exact measured delta, so audio t=0 lines up with video t=0.
+
+### Stage 2 — Post-Convert (x264 ultrafast, when you stop)
+
+When you press STOP, PhantomRec muxes the video and audio together, then encodes the result with **x264 ultrafast** on all available CPU cores — after the game or app you were recording has been closed. You get a compact, shareable file without the recorder ever competing for GPU time.
+
+---
+
+## The Result
+
+- GPU encoder stays at 0% — no encoding on the GPU, ever.
+- Recording uses roughly **half of one CPU core** on a modern 4-core machine (measured: `maxenc.exe` at ~14% of total CPU on 4 cores).
+- Heavy compression happens after you stop, not during recording.
+- No GPU encoder required. No NVENC. No AMF. No QuickSync. CPU only.
+- Runs on hardware from 2 cores up — verified on an Intel Core 2 Quad Q9550 limited to 2 cores.
+
+---
+
+## System Requirements
+
+PhantomRec is designed to work on **any PC from Windows 7 SP1 onward** — no GPU lockouts.
+
+| Requirement | What You Actually Need |
+| :--- | :--- |
+| **CPU** | Any 64-bit x86 CPU with SSE2. The encoder is single-threaded per capture pipeline, so one usable core is the floor. |
+| **RAM** | 4 GB. The audio pipe, JPEG buffers, and writer ring are bounded, so memory use is flat. |
+| **OS** | Windows 7 SP1 through Windows 11. GFX and DDAGrab need newer Windows; GDI is the universal fallback. |
+| **Storage** | Any HDD or SSD. The intermediate MJPEG stream is 30–50× smaller than a lossless codec, so even a slow mechanical drive can keep up. |
+| **GPU** | None required. Any GPU works. See the table below. |
+
+---
+
+## What This Means for Your GPU
+
+| GPU Type | What Happens | Locked Out? |
+| :--- | :--- | :--- |
+| **NVIDIA Kepler+ (GTX 600+)** | Full GFX/DDAGrab support. 60 FPS recording. | ❌ No |
+| **AMD GCN 1.0+ (HD 7000+)** | Full GFX/DDAGrab support. 60 FPS recording. | ❌ No |
+| **NVIDIA Tesla / Fermi (GTX 400/500)** | Capture still works via GDI fallback. GFX/DDAGrab may be slow on some titles because the GPU itself is old. | ❌ No |
+| **AMD TeraScale (HD 6000 or older)** | Capture still works via GDI fallback. Same caveat as above. | ❌ No |
+| **No GPU (Microsoft Basic Display Adapter)** | GDI capture + CPU encoding. Recording is smooth. | ❌ No |
+
+**No one is locked out.** If you have a modern GPU, you get GFX/DDAGrab at 60 FPS. If you have an older one, PhantomRec falls back to GDI and still records. GDI is CPU-bound; if it drops frames, your CPU is the limit, not the GPU.
+
+---
 
 ## A Note on Windows Versions
 
 PhantomRec doesn't care what hardware you have — it cares about your OS, because that determines which capture APIs are available.
 
 | Windows Version | Capture Method | Typical FPS |
-|-----------------|----------------|-------------|
-| Windows 10 / 11 | GFX (D3D11 zero‑copy) | 60 FPS |
-| Windows 8 / 8.1 | DDAGrab (DXGI) | 60 FPS |
-| Windows 7 / Vista | GDI (CPU software) | Up to 30 FPS (BitBlt) |
+| :--- | :--- | :--- |
+| Windows 10 / 11 | GFX (Windows.Graphics.Capture, D3D11) | 60 FPS |
+| Windows 8 / 8.1 | DDAGrab (DXGI Desktop Duplication) | 60 FPS |
+| Windows 7 SP1 | GDI (CPU BitBlt) | Up to 30 FPS |
 
-Fallback chain: GFX → DDAGrab → GDI. If a method isn't supported, PhantomRec automatically drops to the next best option. GDI is the universal fallback.
+**Fallback chain:** GFX → DDAGrab → GDI. If a method isn't supported on your system, PhantomRec automatically drops to the next one. GDI is the universal fallback.
 
-All capture methods write a lossless master file at the native frame rate. The final video is automatically converted to a constant 60 fps x264 file, regardless of the source frame rate.
+---
 
-## Why Choose PhantomRec?
+## What's New in v1.9.8
 
-PhantomRec uses a two‑stage ghost pipeline — this is new for some recorders
+v1.9.8 is the biggest update in months. Two months of work, one goal: smooth recording on any PC.
 
+### Architecture changes
 
-### Stage 1 — Live Capture (ffvhuff lossless, ~5% CPU)
+- **Replaced ffvhuff with MaxRBLX1's Fastest MJPEG.** libjpeg-turbo on a single pinned core. Lower CPU cost, smaller intermediate files, and it stays out of the GPU's way completely.
+- **Bounded writer ring.** Encoded frames go into a 64-slot ring, and a separate writer thread muxes them to disk. Disk stalls no longer drop frames.
+- **`maxsound.exe` for audio.** Dedicated WASAPI loopback capture process instead of an in-process audio thread.
+- **`.t0` marker-based A/V alignment.** Video and audio each write a QPC tick marker at their first sample. PhantomRec reads both and applies the exact measured offset with `adelay` or `atrim` at mux time.
+- **Removed forced frame rate from Stage 2.** The output inherits its frame rate from the intermediate instead of being re-timed, which eliminates the A/V drift that older versions had.
+- **Persistent `tjhandle` and `AVPacket`.** No per-frame allocation in the in-process MJPEG fallback.
 
-The screen is captured and encoded with ffvhuff — a mathematically lossless, intra‑frame codec.
+### Bug fixes
 
-- **Parallel encoding:** uses `-slices` equal to your CPU core count (1 slice for dual‑core systems to avoid thread trashing), keeping CPU usage flat at ~5% regardless of on‑screen action.
-- **Duplicate frames** are skipped automatically.
-- **Massive queues:** video `-thread_queue_size 4096`, audio `-thread_queue_size 4096`, and `-max_muxing_queue_size 50000` to absorb HDD write pauses — zero lag even on slow mechanical drives.
-- **No GPU encoding** means the stop button responds instantly — no encoder queue drain freeze.
+- Fixed a crash on STOP where PhantomRec could receive its own `CTRL_BREAK_EVENT` and exit.
+- Fixed the segment-0 overwrite in the standalone `maxenc.exe` pause path.
+- Fixed the audio child's inherited handle list so ffmpeg's stderr no longer goes to a stale handle.
+- Fixed `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` linkage on MSYS2 UCRT64.
+- In-process capture thread now distinguishes `AVERROR(EAGAIN)` from EOF and no longer loops on permanent source failure.
 
-### Stage 2 — Post‑Convert (x264 ultrafast, after you stop)
+### Known issues (targeted for 1.9.9)
 
-When you press stop, PhantomRec converts the lossless master to a crisp, compact x264 file at 60 FPS using all CPU cores — when your system is idle.
-You get NVENC‑quality file sizes without needing a GPU.
+- **Dual-core STOP and PAUSE can feel slow.** On 2-core systems, PhantomRec and its child processes currently share a CPU core, so the console `q` signal can take up to a second to be processed. The fix is child-process CPU affinity, which will land in 1.9.9. **Recording itself is unaffected.**
+- **The UI thread blocks during Stage 2 conversion.** On long recordings, the window will be unresponsive while x264 runs. A worker-thread rewrite is planned for 1.9.9.
 
-### The Result
-
-- Your GPU stays 100% dedicated to your game or desktop.
-- Recording uses ~5% CPU on any hardware.
-- Heavy compression happens when you're done recording.
-- Instant stop — no encoder queue drain freeze.
-- Smooth output on any CPU from 2008 onward.
-- No GPU required. No NVENC. No AMF. CPU only.
+---
 
 ## What's New in v1.9.7
 
-v1.9.7 is a polish release — building on v1.9.6 with user‑facing improvements and a cleaner experience:
+Polish release:
 
-- 🧹 **Removed power‑plan management** – no longer forces High Performance; respects user's power settings and avoids potential issues.
-- 🎨 **Fixed UI status flicker** – status updates no longer draw black rectangles, giving a smooth, flicker‑free display.
-- 📊 **Progress bar corrected** – removed PBS_MARQUEE and added proper 0–100 range, now correctly shows conversion progress.
-- 🖼️ **Added HD icon** – a 256×256 icon (with 48, 32, and 16px fallbacks) embedded via resource.rc, giving a crisp, professional look in taskbar, Start Menu, Alt+Tab, and File Explorer.
-- 📄 **Version info embedded** – the .exe now shows FileVersion, ProductName, Copyright, etc. in its Properties dialog.
-- 🛠️ **Full UCRT64 compatibility** – verified build process with MSYS2 UCRT64 and windres.
+- 🧹 Removed power-plan management — no longer forces High Performance.
+- 🎨 Fixed UI status flicker — no more black rectangles during updates.
+- 📊 Progress bar corrected — proper 0–100 range, no `PBS_MARQUEE`.
+- 🖼️ Added HD icon — 256×256 with 48, 32, and 16 px fallbacks.
+- 📄 Version info embedded in the `.exe`.
+- 🛠️ Verified build on MSYS2 UCRT64 with `windres`.
 
 ## What's New in v1.9.6
 
-This was a bug‑fix release — the most critical issues from v1.9.5 were resolved:
+Bug-fix release:
 
-- 🎯 **Fixed CMD console window staying open** — the console closes automatically after FFmpeg exits.
-- 🔧 **Fixed FFmpeg not exiting cleanly** — the process now stops reliably every time (attaches console, sends CTRL_BREAK/CTRL_C, force‑kills if needed).
-- 🔇 **Fixed audio thread hang** — pipe write handle is closed before waiting for the audio thread.
-- 🔁 **Fixed progress bar after pause/resume** — duration now correctly subtracts paused time.
-- 📦 **Fixed fragmented files** — segments are always concatenated into a single lossless file when ConvertAfterRecording=no.
-- 🧵 **Fixed race conditions** — all state flags now use Interlocked operations.
-- 🎨 **Fixed font handle leaks** — UI resources are properly cleaned up in WM_DESTROY.
-- ⚡ **Added dual‑core optimization** — `-slices 1` is used for CPUs with 2 or fewer cores to eliminate thread trashing.
-- 🚀 **Direct FFmpeg launch** — no cmd.exe wrapper, giving full control over the FFmpeg process.
+- 🎯 Fixed CMD console window staying open after recording.
+- 🔧 Fixed FFmpeg not exiting cleanly — process stops reliably every time.
+- 🔇 Fixed audio thread hang — pipe write handle closed before waiting.
+- 🔁 Fixed progress bar after pause/resume.
+- 📦 Fixed fragmented files — segments always concatenate into a single file.
+- 🧵 Fixed race conditions — all state flags use Interlocked operations.
+- 🎨 Fixed font handle leaks.
+- 🚀 Direct FFmpeg launch — no `cmd.exe` wrapper.
+
+---
 
 ## Settings — How to Control
 
-All settings are in `Settings.ini` (same folder as PhantomRec.exe).
-Edit it while the program is running — changes take effect within 2 seconds (only hotkeys and appearance are applied mid‑recording; capture method and conversion flag are deferred until idle).
+All settings are in `Settings.ini` (same folder as `PhantomRec.exe`).
+Edit it while the program is running — hotkeys and appearance apply within 2 seconds. Capture method and conversion flag are deferred until idle.
 
-```
+```ini
 [Settings]
 Hotkey=F10
 PauseHotkey=P
 ConvertAfterRecording=yes
 CaptureMethod=auto
+MJPEGQuality=85
 
 [Appearance]
 Background=C:\path\to\image.png
@@ -188,67 +169,112 @@ Font=C:\path\to\font.ttf
 FontSize=14
 FontColor=16777215
 ```
+
 | Setting | Description |
-|---------|-------------|
-| `Hotkey` | F1‑F12 for function keys, or a single letter for Ctrl+ (e.g. R = Ctrl+R). |
-| `PauseHotkey` | Same format as Hotkey. |
-| `ConvertAfterRecording` | `yes` = automatically compress after recording (recommended).<br>`no` = keep the raw segment files (`*_segN_temp.mkv` + `segments.txt`) in the output folder. You must manually concatenate or delete them. |
+| :--- | :--- |
+| `Hotkey` | `F1`–`F12` for function keys, or a single letter for `Ctrl+letter` (e.g. `R` = Ctrl+R). |
+| `PauseHotkey` | Same format as `Hotkey`. |
+| `ConvertAfterRecording` | `yes` = compress after recording (recommended). `no` = keep the high-quality intermediate file. |
 | `CaptureMethod` | `auto` (default), `gfx`, `ddagrab`, `gdi`. |
+| `MJPEGQuality` | 1–100. Default 85. Lower values = smaller intermediate files, faster encode, slightly softer image. Try 40–50 on very old hardware. |
 
-## ⚠️ Important: When `ConvertAfterRecording=no`
+---
 
-When `ConvertAfterRecording=no`, PhantomRec **keeps the lossless master file** instead of compressing it to x264.
+## When `ConvertAfterRecording=no`
 
 | Setting | Result |
 | :--- | :--- |
-| `ConvertAfterRecording=yes` | Lossless capture (`ffvhuff`) → compressed to x264 → lossless file deleted. Final file: small, shareable. |
-| `ConvertAfterRecording=no` | Lossless capture (`ffvhuff`) → lossless file kept. Final file: large, perfect quality. |
+| `ConvertAfterRecording=yes` | MJPEG intermediate → muxed with audio → x264 ultrafast → intermediate deleted. Final file: small, ready to share. |
+| `ConvertAfterRecording=no` | MJPEG intermediate → muxed with audio → kept as-is. Final file: large, high quality, ideal for editing or re-encoding. |
 
 ### File Output
 
-- **`yes` (default):** `PhantomRec_YYYYMMDD_HHMMSS.mkv` – compact x264, ready to share.
-- **`no`:** `PhantomRec_YYYYMMDD_HHMMSS_lossless.mkv` – lossless ffvhuff, ideal for editing or re‑encoding later.
+- **`yes` (default):** `PhantomRec_YYYYMMDD_HHMMSS.mkv` — compact x264, ready to share.
+- **`no`:** `PhantomRec_YYYYMMDD_HHMMSS_lossless.mkv` — high-quality MJPEG intermediate, ideal for editing.
 
-> 💡 **Tip:** The lossless file is mathematically identical to what was captured. Use it if you plan to edit or re‑encode later. For everyday sharing, the compressed file is best.
+> **Note:** The `_lossless` filename is kept for backwards compatibility. The MJPEG intermediate is a high-quality file, not mathematically lossless. If you need mathematically lossless output for a specific workflow, run the intermediate through `maxsengine.exe` with an appropriate lossless codec before editing.
 
-### No Manual Work Needed
-
-PhantomRec **automatically concatenates all segments** into a single file – you never need to manually merge segments or delete temporary files.
+---
 
 ## Building from Source
 
 ### Requirements
 
-- MinGW‑w64 (UCRT64)
-- Windows SDK (included with MinGW)
+- MSYS2 with the **UCRT64** toolchain
+- MinGW-w64 (comes with MSYS2 UCRT64)
+- FFmpeg development libraries (`libturbojpeg`, `libavformat`, `libavcodec`, `libavfilter`, `libavutil`, `libavdevice`)
 
 ### Compile
 
-```
-# Step 1: Compile the pure C core
-gcc -std=c11 -O2 -c src/phantomrec_core.c -o phantomrec_core.o
+```bash
+# Step 1: Build maxenc.exe (Stage 1 video)
+gcc -std=c11 -O2 \
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
+    src/maxenc.c -o maxenc.exe \
+    -lturbojpeg -lavformat -lavcodec -lavfilter -lavutil -lavdevice \
+    -lole32 -luuid -lwinmm
 
-# Step 2: Compile the resource file (for HD icon & version info)
+# Step 2: Build maxsound.exe (Stage 1b audio)
+gcc -std=c11 -O2 \
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
+    src/maxsound.c -o maxsound.exe \
+    -lole32 -luuid -lavformat -lavcodec -lavutil
+
+# Step 3: Build the C core
+gcc -std=c11 -O2 \
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
+    -c src/phantomrec_coreCopy.c -o phantomrec_core.o
+
+# Step 4: Build the GUID definitions (WASAPI/KSDATAFORMAT symbols)
+gcc -std=c11 -O2 \
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
+    -c src/phantomrec_guids.c -o phantomrec_guids.o
+
+# Step 5: Build the C++ UI
+g++ -std=c++17 -O2 \
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
+    -c src/phantomrecCopy.cpp -o phantomrec_ui.o
+
+# Step 6: Compile the resource file (HD icon + version info)
 windres src/resource.rc -O coff -o resource.o
 
-# Step 3: Link with C++ UI
-g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 \
-    phantomrec_core.o src/PhantomRec.cpp resource.o \
+# Step 7: Link with g++ (NOT gcc — the UI is C++)
+g++ -O2 -mwindows \
+    -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
+    phantomrec_core.o phantomrec_guids.o phantomrec_ui.o resource.o \
     -o PhantomRec.exe \
+    -lturbojpeg \
+    -lavformat -lavcodec -lavfilter -lavutil -lavdevice \
     -lcomctl32 -lshell32 -luser32 -lgdi32 -lkernel32 \
-    -ladvapi32 -lole32 -luuid -lksuser -lavrt -lgdiplus -lcomdlg32
+    -ladvapi32 -lole32 -luuid -lavrt \
+    -lgdiplus -lcomdlg32 -lwindowscodecs \
+    -static-libgcc -static-libstdc++
 ```
-> ⚠️ `-D_WIN32_WINNT=0x0A00` is strictly required.
-> Without it, the binary targets XP compatibility and the recording pipeline fails with 0 FPS.
 
-> **Note:** There is no `-mwindows` flag — the console is intentionally kept visible for transparency, debugging, and to show FFmpeg logs.
+> ⚠️ `-D_WIN32_WINNT=0x0A00` (and matching `WINVER` and `NTDDI_VERSION`) is required on MSYS2 UCRT64. Without it, several Windows headers gate the WASAPI and process-creation declarations and the build will fail.
+
+> ⚠️ The final link uses **`g++`**, not `gcc`. The UI is C++ and needs `libstdc++`. `-static-libgcc -static-libstdc++` bakes the runtime in so the `.exe` is self-contained.
+
+---
 
 ## What PhantomRec Does Not Do (Yet)
 
 - **Streaming** — PhantomRec is a recorder, not a streaming tool.
 - **Webcam overlay** — Not supported.
-- **Per‑window capture** — PhantomRec captures the entire monitor.
+- **Per-window capture** — PhantomRec captures the entire monitor.
 - **Game capture via hooking** — Planned for a future release (exclusive fullscreen support).
+- **GPU encoding** — Not now, not ever. That's the whole point.
+- **Microphone handling** — Planned for future release
+
+---
+
+## On FRAPS
+
+FRAPS hasn't been updated in over a decade. PhantomRec is the recorder that should have replaced it — same lightweight footprint on the same class of hardware, no game hooking, no anti-cheat conflicts, and a post-conversion stage that gives you compact files without stealing FPS during play.
+
+PhantomRec doesn't remove FRAPS. It just makes FRAPS unnecessary.
+
+---
 
 ## License & Credits
 
