@@ -1,9 +1,10 @@
-// PhantomRec.cpp — PhantomRec v1.9.7 C++ UI
+// PhantomRec.cpp — PhantomRec v1.9.8 C++ UI
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | Pure C Core + C++ UI
-// All v1.9.6 fixes applied: font handle cleanup, version bump, minor tweaks.
-// v1.9.7: Removed power plan management, fixed status update flicker, progress bar style.
+// v1.9.8: Stage 1 is MaxRBLX1's Fastest MJPEG only. Huffyuv removed.
+
+#include "phantomrec_coreCopy.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -12,20 +13,21 @@
 #include <shlobj.h>
 #include <commctrl.h>
 #include <gdiplus.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 #include <fstream>
 #include <cstring>
+#include "resource.h"
 
 using std::min;
+using Microsoft::WRL::ComPtr;
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
-extern "C" {
-#include "phantomrec_core.h"
-}
-
-#define PHANTOMREC_VERSION "1.9.7"
+#define PHANTOMREC_VERSION "1.9.8"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -41,8 +43,9 @@ extern "C" {
 #define ID_PREVIEW_BG      1008
 #define ID_PREVIEW_FONT    1009
 #define ID_BTN_COLOR       1010
+#define ID_BTN_STROKE_COLOR 1011
 
-// Custom messages for thread‑safe UI updates
+// Custom messages for thread-safe UI updates
 #define WM_PR_STATUS     (WM_APP + 20)
 #define WM_PR_BUTTON     (WM_APP + 21)
 #define WM_PR_PROGRESS   (WM_APP + 22)
@@ -54,7 +57,7 @@ extern "C" {
 static PhantomRecCore g_Core;
 static HWND g_hWnd = nullptr;
 static HWND g_btnRecord = nullptr;
-static HWND g_lblStatus = nullptr;
+static HWND g_btnSettings = nullptr;
 static HWND g_progressBar = nullptr;
 static UINT g_recordHotkey = VK_F10;
 static UINT g_pauseHotkey = 'P';
@@ -64,41 +67,101 @@ static std::string g_customBackground;
 static std::string g_customFont;
 static int g_customFontSize = 14;
 static COLORREF g_customColorRef = RGB(255, 255, 255);
+static COLORREF g_customStrokeColorRef = RGB(0, 0, 0);
+static int g_customStrokeWidth = 2;
 static ULONG_PTR g_gdiplusToken = 0;
+static bool g_backgroundIsAnimated = false;
 static bool g_backgroundIsGif = false;
 static UINT_PTR g_gifTimerId = 0;
 static Gdiplus::Image* g_gifImage = nullptr;
 static UINT g_gifFrameCount = 0;
 static UINT g_gifCurrentFrame = 0;
 static std::string g_outputDir;
-static std::string g_maxsenginePath;
 static FILETIME g_iniLastWrite = {0};
 
 static DWORD g_mainThreadId = 0;
 
-// Cached static background image (non‑GIF)
+// Status text for GDI+ drawing
+static std::string g_statusText = "Ready - F10 to record";
+
+// Cached static background image (non-GIF)
 static Gdiplus::Image* g_cachedBgImage = nullptr;
 static std::string g_cachedBgPath;
 
-// Font handles for main window controls (for cleanup)
+// Font handles for main window controls
 static HFONT g_hStatusFont = nullptr;
 static HFONT g_hButtonFont = nullptr;
-static HFONT g_hStaticFont = nullptr;  // for WM_CTLCOLORSTATIC
-static HFONT g_hBtnStaticFont = nullptr; // for WM_CTLCOLORBTN (if needed)
+static HFONT g_hStaticFont = nullptr;
+static HFONT g_hBtnStaticFont = nullptr;
+
+using namespace Gdiplus;
+
+// ============================================================================
+// GIF Preview State for Settings Window
+// ============================================================================
+struct GifPreviewState {
+    Image* gifImage;
+    UINT frameCount;
+    UINT currentFrame;
+    UINT_PTR timerId;
+    UINT frameDelay;
+    bool isGif;
+};
+
+static GifPreviewState g_previewGifState = {0};
+
+// WIC animated background state
+struct WicAnimatedBg {
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> currentFrame;
+    UINT frameCount = 0;
+    UINT currentIndex = 0;
+    UINT_PTR timerId = 0;
+    UINT frameDelay = 100;
+    bool isAnimated = false;
+};
+static WicAnimatedBg g_wicBg;
 
 static void UpdateUI();
 static void DoUpdateStatus(const char* message);
 static void DoUpdateButton(const char* text);
 
 // ============================================================================
-// Helper: Read GIF frame delay from metadata
+// Helper: Draw text with stroke
 // ============================================================================
-static UINT GetGifFrameDelay(Gdiplus::Image* image, UINT frameCount) {
+static void DrawTextWithStroke(Graphics* graphics, const WCHAR* text,
+                                const Font* font, const RectF& layoutRect,
+                                const Color& textColor, const Color& strokeColor,
+                                REAL strokeWidth) {
+    GraphicsPath path;
+    StringFormat format;
+    format.SetAlignment(StringAlignmentCenter);
+    format.SetLineAlignment(StringAlignmentCenter);
+
+    FontFamily fontFamily;
+    font->GetFamily(&fontFamily);
+
+    path.AddString(text, -1, &fontFamily, font->GetStyle(),
+                   font->GetSize(), layoutRect, &format);
+
+    Pen strokePen(strokeColor, strokeWidth);
+    strokePen.SetLineJoin(LineJoinRound);
+    graphics->DrawPath(&strokePen, &path);
+
+    SolidBrush textBrush(textColor);
+    graphics->FillPath(&textBrush, &path);
+}
+
+// ============================================================================
+// Helper: Read GIF frame delay
+// ============================================================================
+static UINT GetGifFrameDelay(Image* image, UINT frameCount) {
     UINT frameDelay = 100;
     UINT size = image->GetPropertyItemSize(PropertyTagFrameDelay);
     if (size > 0) {
-        Gdiplus::PropertyItem* prop = (Gdiplus::PropertyItem*)malloc(size);
-        if (prop && image->GetPropertyItem(PropertyTagFrameDelay, size, prop) == Gdiplus::Ok) {
+        PropertyItem* prop = (PropertyItem*)malloc(size);
+        if (prop && image->GetPropertyItem(PropertyTagFrameDelay, size, prop) == Ok) {
             long* delays = (long*)prop->value;
             if (frameCount > 0 && delays[0] > 0) {
                 frameDelay = delays[0] * 10;
@@ -111,7 +174,7 @@ static UINT GetGifFrameDelay(Gdiplus::Image* image, UINT frameCount) {
 }
 
 // ============================================================================
-// Thread‑safe core callbacks
+// Thread-safe core callbacks
 // ============================================================================
 static void OnStatusUpdate(const char* message) {
     if (GetCurrentThreadId() != g_mainThreadId) {
@@ -135,6 +198,7 @@ static void OnProgressUpdate(int percent) {
     if (GetCurrentThreadId() != g_mainThreadId) {
         PostMessageA(g_hWnd, WM_PR_PROGRESS, (WPARAM)percent, 0);
     } else {
+        ShowWindow(g_progressBar, SW_SHOW);
         SendMessageA(g_progressBar, PBM_SETPOS, percent, 0);
         char buf[64];
         sprintf_s(buf, "Processing video... %d%%", percent);
@@ -148,6 +212,7 @@ static void OnConversionDone(int success, const char* filePath) {
         PostMessageA(g_hWnd, WM_PR_CONV_DONE, (WPARAM)success, (LPARAM)pathCopy);
     } else {
         SendMessageA(g_progressBar, PBM_SETPOS, 0, 0);
+        ShowWindow(g_progressBar, SW_HIDE);
         if (success && filePath) {
             char buf[256];
             long long fs = Core_GetFileSize(filePath);
@@ -163,13 +228,15 @@ static void OnConversionDone(int success, const char* filePath) {
 }
 
 // ============================================================================
-// Direct UI updaters (fixed: no manual black rect, just set text and invalidate)
+// Direct UI updaters
 // ============================================================================
 static void DoUpdateStatus(const char* message) {
-    if (g_lblStatus && IsWindow(g_lblStatus) && g_hWnd) {
-        SetWindowTextA(g_lblStatus, message);
-        InvalidateRect(g_lblStatus, nullptr, TRUE);
-        UpdateWindow(g_lblStatus);
+    if (message) {
+        g_statusText = message;
+    }
+    if (g_hWnd && IsWindow(g_hWnd)) {
+        InvalidateRect(g_hWnd, nullptr, TRUE);
+        UpdateWindow(g_hWnd);
     }
 }
 
@@ -228,34 +295,58 @@ static std::string GetHotkeyName(UINT vk) {
 
 static void CreateDefaultIni() {
     std::ofstream ini(g_iniPath);
-    ini << "; ========================================\r\n"
-        << "; PhantomRec v1.9.7 Settings\r\n"
-        << "; Made by MaxRBLX1\r\n"
+    ini << "; ============================================================\r\n"
+        << "; PhantomRec v1.9.8 Settings\r\n"
+        << "; Built by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
-        << "; ========================================\r\n"
-        << "; Stage 1: Ut Video lossless\r\n"
-        << "; Stage 2: x264 Post-Convert (after recording)\r\n"
+        << "; ============================================================\r\n"
         << ";\r\n"
-        << "; CaptureMethod: How PhantomRec captures your screen\r\n"
-        << ";   auto    = PhantomRec picks the best method for your OS\r\n"
-        << ";   ddagrab = DXGI Desktop Duplication (GPU, 60 FPS, Win8+)\r\n"
-        << ";   gfx     = D3D11 Graphics Capture (GPU, 60 FPS, Win10+)\r\n"
-        << ";   gdi     = CPU software capture (up to 30 FPS, any Windows)\r\n"
+        << "; PhantomRec records in two stages, both automatic:\r\n"
         << ";\r\n"
-        << "; Hotkey: F1-F12 for function keys\r\n"
-        << ";         A-Z for Ctrl+Letter hotkeys (e.g., R = Ctrl+R)\r\n"
+        << ";   Stage 1 - LIVE CAPTURE (while you record)\r\n"
+        << ";             MaxRBLX1's Fastest MJPEG.\r\n"
+        << ";             Runs on one CPU core. Never touches your GPU encoder.\r\n"
         << ";\r\n"
-        << "; PauseHotkey: Same format as Hotkey\r\n"
+        << ";   Stage 2 - POST-CONVERT (after you stop)\r\n"
+        << ";             x264 ultrafast.\r\n"
+        << ";             Compresses the master into a small final .mkv.\r\n"
         << ";\r\n"
-        << "; ConvertAfterRecording: yes or no\r\n"
-        << ";   yes = Automatically compress after recording (recommended)\r\n"
-        << ";   no  = Keep the lossless temp file (very large)\r\n"
-        << "; ========================================\r\n\r\n"
+        << "; There is no encoder setting to change. Both stages pick the\r\n"
+        << "; best options for your hardware automatically. The only knob\r\n"
+        << "; that affects video quality is MJPEGQuality below.\r\n"
+        << ";\r\n"
+        << "; ============================================================\r\n"
+        << "; Hotkey - start or stop a recording\r\n"
+        << "; ------------------------------------------------------------\r\n"
+        << ";   F1 - F12       Function keys\r\n"
+        << ";   A - Z           Ctrl + letter (e.g. R = Ctrl+R)\r\n"
+        << ";\r\n"
+        << "; PauseHotkey - pause or resume while recording\r\n"
+        << ";   Same format as Hotkey.\r\n"
+        << ";\r\n"
+        << "; ConvertAfterRecording - run Stage 2 when recording stops\r\n"
+        << ";   yes   Compress into a small final .mkv  (recommended)\r\n"
+        << ";   no    Keep the raw master file          (very large)\r\n"
+        << ";\r\n"
+        << "; CaptureMethod - how PhantomRec reads your screen\r\n"
+        << ";   auto      Pick the best method for your Windows version\r\n"
+        << ";   gfx       D3D11 Graphics Capture      (Win10+, 60 FPS)\r\n"
+        << ";   ddagrab   DXGI Desktop Duplication    (Win8+, 60 FPS)\r\n"
+        << ";   gdi       GDI software capture        (any Windows, up to 30 FPS)\r\n"
+        << ";\r\n"
+        << "; MJPEGQuality - the quality of the recording\r\n"
+        << ";   1     smallest master, lowest quality\r\n"
+        << ";   75    balanced (default)\r\n"
+        << ";   100   best quality, larger master\r\n"
+        << ";   On slow PCs try 40-60. On fast PCs try 85-95.\r\n"
+        << "; ============================================================\r\n"
+        << "\r\n"
         << "[Settings]\r\n"
         << "Hotkey=F10\r\n"
         << "PauseHotkey=P\r\n"
         << "ConvertAfterRecording=yes\r\n"
-        << "CaptureMethod=auto\r\n";
+        << "CaptureMethod=auto\r\n"
+        << "MJPEGQuality=85\r\n";
     ini.close();
 }
 
@@ -264,14 +355,14 @@ static void LoadConfiguration() {
     GetPrivateProfileStringA("Settings", "Hotkey", "F10", buf, sizeof(buf), g_iniPath.c_str());
     g_recordHotkey = ParseHotkey(buf);
     if (g_recordHotkey == 0) g_recordHotkey = VK_F10;
-    
+
     GetPrivateProfileStringA("Settings", "PauseHotkey", "P", buf, sizeof(buf), g_iniPath.c_str());
     g_pauseHotkey = ParseHotkey(buf);
     if (g_pauseHotkey == 0) g_pauseHotkey = 'P';
-    
+
     GetPrivateProfileStringA("Settings", "ConvertAfterRecording", "yes", buf, sizeof(buf), g_iniPath.c_str());
     g_Core.convertAfterRecording = (strcmp(buf, "no") != 0);
-    
+
     char capBuf[32];
     GetPrivateProfileStringA("Settings", "CaptureMethod", "auto", capBuf, sizeof(capBuf), g_iniPath.c_str());
     if (strcmp(capBuf, "ddagrab") == 0)
@@ -282,7 +373,15 @@ static void LoadConfiguration() {
         Core_SetCaptureMethodEx(&g_Core, CAPTURE_GDI);
     else
         Core_SetCaptureMethodEx(&g_Core, CAPTURE_AUTO);
-    
+
+    // Stage 1 is MaxRBLX1's Fastest MJPEG. videoEncoder is set by the core
+    // at record time (0 = maxenc.exe, 2 = in-process). No INI key controls it.
+    // Legacy "Codec=" keys in older Settings.ini files are ignored silently.
+
+    g_Core.mjpegQuality = GetPrivateProfileIntA("Settings", "MJPEGQuality", 75, g_iniPath.c_str());
+    if (g_Core.mjpegQuality < 1)   g_Core.mjpegQuality = 1;
+    if (g_Core.mjpegQuality > 100) g_Core.mjpegQuality = 100;
+
     HANDLE hFile = CreateFileA(g_iniPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -335,7 +434,7 @@ static void EnsureBackgroundCached() {
     auto dot = ext.find_last_of('.');
     if (dot != std::string::npos) {
         ext = ext.substr(dot);
-        if (ext == ".gif" || ext == ".GIF") {
+        if (ext == ".gif" || ext == ".GIF" || ext == ".webp" || ext == ".WEBP") {
             ClearCachedBackground();
             return;
         }
@@ -344,8 +443,8 @@ static void EnsureBackgroundCached() {
         return;
     ClearCachedBackground();
     std::wstring wpath(g_customBackground.begin(), g_customBackground.end());
-    g_cachedBgImage = new Gdiplus::Image(wpath.c_str());
-    if (g_cachedBgImage->GetLastStatus() == Gdiplus::Ok) {
+    g_cachedBgImage = new Image(wpath.c_str());
+    if (g_cachedBgImage->GetLastStatus() == Ok) {
         g_cachedBgPath = g_customBackground;
     } else {
         delete g_cachedBgImage;
@@ -372,6 +471,10 @@ static void LoadCustomizations() {
     }
     g_customFontSize = GetPrivateProfileIntA("Appearance", "FontSize", 14, g_iniPath.c_str());
     g_customColorRef = (COLORREF)GetPrivateProfileIntA("Appearance", "FontColor", RGB(255, 255, 255), g_iniPath.c_str());
+    g_customStrokeColorRef = (COLORREF)GetPrivateProfileIntA("Appearance", "StrokeColor", RGB(0, 0, 0), g_iniPath.c_str());
+    g_customStrokeWidth = GetPrivateProfileIntA("Appearance", "StrokeWidth", 2, g_iniPath.c_str());
+    if (g_customStrokeWidth < 0) g_customStrokeWidth = 0;
+    if (g_customStrokeWidth > 10) g_customStrokeWidth = 10;
 }
 
 static void SaveCustomizations() {
@@ -382,60 +485,167 @@ static void SaveCustomizations() {
     WritePrivateProfileStringA("Appearance", "FontSize", buf, g_iniPath.c_str());
     sprintf_s(buf, "%d", (int)g_customColorRef);
     WritePrivateProfileStringA("Appearance", "FontColor", buf, g_iniPath.c_str());
+    sprintf_s(buf, "%d", (int)g_customStrokeColorRef);
+    WritePrivateProfileStringA("Appearance", "StrokeColor", buf, g_iniPath.c_str());
+    sprintf_s(buf, "%d", g_customStrokeWidth);
+    WritePrivateProfileStringA("Appearance", "StrokeWidth", buf, g_iniPath.c_str());
 }
 
 // ============================================================================
-// Settings Window (identical to v1.9, with fixes)
+// WIC Animated Background
+// ============================================================================
+static bool InitWicFactory() {
+    if (!g_wicBg.factory) {
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+            CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wicBg.factory));
+        return SUCCEEDED(hr);
+    }
+    return true;
+}
+
+static bool LoadWicAnimatedBackground(const std::string& path) {
+    if (!InitWicFactory()) return false;
+    if (g_wicBg.timerId) { KillTimer(g_hWnd, g_wicBg.timerId); g_wicBg.timerId = 0; }
+    g_wicBg.decoder.Reset();
+    g_wicBg.currentFrame.Reset();
+    std::wstring wpath(path.begin(), path.end());
+    HRESULT hr = g_wicBg.factory->CreateDecoderFromFilename(wpath.c_str(), nullptr,
+        GENERIC_READ, WICDecodeMetadataCacheOnDemand, &g_wicBg.decoder);
+    if (SUCCEEDED(hr)) {
+        hr = g_wicBg.decoder->GetFrameCount(&g_wicBg.frameCount);
+        if (SUCCEEDED(hr) && g_wicBg.frameCount > 1) {
+            g_wicBg.isAnimated = true;
+            g_wicBg.currentIndex = 0;
+            g_wicBg.decoder->GetFrame(0, &g_wicBg.currentFrame);
+            g_wicBg.frameDelay = 100;
+            g_wicBg.timerId = SetTimer(g_hWnd, 3003, g_wicBg.frameDelay, nullptr);
+            return true;
+        } else {
+            g_wicBg.isAnimated = false;
+            g_wicBg.frameCount = 1;
+            g_wicBg.decoder->GetFrame(0, &g_wicBg.currentFrame);
+        }
+    }
+    return false;
+}
+
+static void DrawWicFrame(HDC hdc, const RECT& rect) {
+    if (!g_wicBg.currentFrame) return;
+    UINT width = 0, height = 0;
+    g_wicBg.currentFrame->GetSize(&width, &height);
+    HDC memDC = CreateCompatibleDC(hdc);
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -((int)height);
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP hBitmap = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (hBitmap && bits) {
+        UINT stride = width * 4;
+        g_wicBg.currentFrame->CopyPixels(nullptr, stride, stride * height, (BYTE*)bits);
+        HGDIOBJ oldBitmap = SelectObject(memDC, hBitmap);
+        int rectWidth = rect.right - rect.left;
+        int rectHeight = rect.bottom - rect.top;
+        float scale = min((float)rectWidth / width, (float)rectHeight / height);
+        int drawW = (int)(width * scale), drawH = (int)(height * scale);
+        int drawX = (rectWidth - drawW) / 2, drawY = (rectHeight - drawH) / 2;
+        SetStretchBltMode(hdc, HALFTONE);
+        StretchBlt(hdc, drawX, drawY, drawW, drawH, memDC, 0, 0, width, height, SRCCOPY);
+        SelectObject(memDC, oldBitmap);
+        DeleteObject(hBitmap);
+    }
+    DeleteDC(memDC);
+}
+
+// ============================================================================
+// GIF Animation Helper for Settings Preview
+// ============================================================================
+static void StartGifAnimation(HWND hWnd, HWND previewWnd, const std::string& path, GifPreviewState* state) {
+    if (state->timerId) {
+        KillTimer(hWnd, state->timerId);
+        state->timerId = 0;
+    }
+    if (state->gifImage) {
+        delete state->gifImage;
+        state->gifImage = nullptr;
+    }
+
+    std::wstring wpath(path.begin(), path.end());
+    state->gifImage = new Image(wpath.c_str());
+
+    if (state->gifImage->GetLastStatus() == Ok) {
+        GUID pageGuid = FrameDimensionTime;
+        state->frameCount = state->gifImage->GetFrameCount(&pageGuid);
+        state->isGif = true;
+        state->currentFrame = 0;
+
+        if (state->frameCount > 1) {
+            UINT size = state->gifImage->GetPropertyItemSize(PropertyTagFrameDelay);
+            if (size > 0) {
+                PropertyItem* prop = (PropertyItem*)malloc(size);
+                if (prop && state->gifImage->GetPropertyItem(PropertyTagFrameDelay, size, prop) == Ok) {
+                    long* delays = (long*)prop->value;
+                    if (delays[0] > 0) {
+                        state->frameDelay = delays[0] * 10;
+                        if (state->frameDelay < 16) state->frameDelay = 16;
+                    }
+                }
+                free(prop);
+            }
+
+            state->timerId = SetTimer(hWnd, 3002, state->frameDelay, nullptr);
+        }
+    }
+}
+
+// ============================================================================
+// Helper: Apply background with aspect ratio preservation
 // ============================================================================
 static void ApplyBackground(HWND previewWnd, const std::string& path) {
     if (!FileExists(path)) return;
-    Gdiplus::Image image(std::wstring(path.begin(), path.end()).c_str());
-    if (image.GetLastStatus() != Gdiplus::Ok) return;
-    RECT rect; GetClientRect(previewWnd, &rect);
-    HDC hdc = GetDC(previewWnd);
-    HDC memDC = CreateCompatibleDC(hdc);
-    HBITMAP memBmp = CreateCompatibleBitmap(hdc, rect.right, rect.bottom);
-    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
-    Gdiplus::Graphics graphics(memDC);
-    graphics.DrawImage(&image, 0, 0, rect.right, rect.bottom);
-    BitBlt(hdc, 0, 0, rect.right, rect.bottom, memDC, 0, 0, SRCCOPY);
-    SelectObject(memDC, oldBmp); DeleteObject(memBmp); DeleteDC(memDC);
-    ReleaseDC(previewWnd, hdc);
+    InvalidateRect(previewWnd, nullptr, TRUE);
 }
 
+// ============================================================================
+// Helper: Apply font with stroke support
+// ============================================================================
 static void ApplyFont(HWND previewWnd, const std::string& path, int size) {
     if (!FileExists(path)) return;
     AddFontResourceExA(path.c_str(), FR_PRIVATE, 0);
     std::string fileName = path;
     auto pos = fileName.find_last_of("\\/");
     if (pos != std::string::npos) fileName = fileName.substr(pos + 1);
-    std::string faceName;
-    HDC hdc = GetDC(previewWnd);
-    LOGFONTA lf = {0}; lf.lfCharSet = DEFAULT_CHARSET;
-    strncpy_s(lf.lfFaceName, sizeof(lf.lfFaceName), fileName.c_str(), _TRUNCATE);
-    HFONT testFont = CreateFontA(size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE, fileName.c_str());
-    if (testFont) { SelectObject(hdc, testFont); GetTextFaceA(hdc, LF_FACESIZE, lf.lfFaceName); faceName = lf.lfFaceName; DeleteObject(testFont); }
-    ReleaseDC(previewWnd, hdc);
-    if (faceName.empty()) { faceName = fileName; pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos); }
+    std::string faceName = fileName;
+    pos = faceName.find_last_of('.');
+    if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+
     HFONT hFont = CreateFontA(size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
     if (hFont) {
         HFONT hOldFont = (HFONT)SendMessageA(previewWnd, WM_GETFONT, 0, 0);
         SendMessageA(previewWnd, WM_SETFONT, (WPARAM)hFont, TRUE);
-        if (hOldFont && hOldFont != (HFONT)GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(hOldFont);
+        if (hOldFont && hOldFont != (HFONT)GetStockObject(DEFAULT_GUI_FONT))
+            DeleteObject(hOldFont);
         InvalidateRect(previewWnd, nullptr, TRUE);
     }
 }
 
+// ============================================================================
+// Settings Window
+// ============================================================================
 static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    static HWND previewBg, previewFont, editFontSize;
+    static HWND previewBg, previewFont, editFontSize, editStrokeWidth;
     static std::string selectedBg, selectedFont;
     static int selectedFontSize;
     static COLORREF selectedColor;
+    static COLORREF selectedStrokeColor;
+    static int selectedStrokeWidth;
     static HFONT hPreviewFontHandle = nullptr;
+    static GifPreviewState gifState = {0};
 
     switch (m) {
     case WM_CREATE: {
@@ -443,98 +653,374 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         selectedFont = g_customFont;
         selectedFontSize = g_customFontSize;
         selectedColor = g_customColorRef;
-        CreateWindowA("STATIC", "Background", WS_VISIBLE | WS_CHILD | SS_LEFT, 15, 10, 280, 20, h, nullptr, nullptr, nullptr);
-        previewBg = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_BLACKRECT | SS_SUNKEN, 15, 35, 600, 180, h, (HMENU)ID_PREVIEW_BG, nullptr, nullptr);
-        CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 15, 225, 80, 22, h, (HMENU)ID_BTN_BROWSE_BG, nullptr, nullptr);
-        CreateWindowA("BUTTON", "Reset", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 105, 225, 80, 22, h, (HMENU)ID_BTN_RESET_BG, nullptr, nullptr);
-        CreateWindowA("STATIC", "Font", WS_VISIBLE | WS_CHILD | SS_LEFT, 15, 260, 280, 20, h, nullptr, nullptr, nullptr);
-        previewFont = CreateWindowA("STATIC", "MaxRBLX1", WS_VISIBLE | WS_CHILD | SS_CENTER | SS_SUNKEN, 15, 280, 600, 50, h, (HMENU)ID_PREVIEW_FONT, nullptr, nullptr);
-        CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 15, 340, 80, 22, h, (HMENU)ID_BTN_BROWSE_FONT, nullptr, nullptr);
-        CreateWindowA("STATIC", "Size:", WS_VISIBLE | WS_CHILD | SS_RIGHT, 90, 342, 40, 20, h, nullptr, nullptr, nullptr);
-        editFontSize = CreateWindowA("EDIT", std::to_string(selectedFontSize).c_str(), WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER, 135, 340, 45, 22, h, (HMENU)ID_EDIT_FONTSIZE, nullptr, nullptr);
-        CreateWindowA("STATIC", "Color:", WS_VISIBLE | WS_CHILD | SS_RIGHT, 180, 342, 50, 20, h, nullptr, nullptr, nullptr);
-        CreateWindowA("BUTTON", "Pick Color", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 235, 340, 80, 22, h, (HMENU)ID_BTN_COLOR, nullptr, nullptr);
-        CreateWindowA("BUTTON", "Apply", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 200, 390, 80, 28, h, (HMENU)ID_BTN_APPLY, nullptr, nullptr);
-        CreateWindowA("BUTTON", "Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 300, 390, 80, 28, h, (HMENU)IDCANCEL, nullptr, nullptr);
-        if (!selectedBg.empty()) ApplyBackground(previewBg, selectedBg);
-        if (!selectedFont.empty()) ApplyFont(previewFont, selectedFont, selectedFontSize);
+        selectedStrokeColor = g_customStrokeColorRef;
+        selectedStrokeWidth = g_customStrokeWidth;
+
+        memset(&gifState, 0, sizeof(gifState));
+
+        const int margin = 15;
+        const int labelWidth = 80;
+        const int ctrlWidth = 80;
+        const int gap = 10;
+        const int ctrlHeight = 22;
+
+        CreateWindowA("STATIC", "Background", WS_VISIBLE | WS_CHILD | SS_LEFT,
+                      margin, 10, 280, 20, h, nullptr, nullptr, nullptr);
+
+        previewBg = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_OWNERDRAW,
+                                  margin, 30, 600, 150, h, (HMENU)ID_PREVIEW_BG, nullptr, nullptr);
+
+        CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                      margin, 190, ctrlWidth, ctrlHeight, h, (HMENU)ID_BTN_BROWSE_BG, nullptr, nullptr);
+
+        CreateWindowA("BUTTON", "Reset", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                      margin + ctrlWidth + gap, 190, ctrlWidth, ctrlHeight, h, (HMENU)ID_BTN_RESET_BG, nullptr, nullptr);
+
+        CreateWindowA("STATIC", "Font", WS_VISIBLE | WS_CHILD | SS_LEFT,
+                      margin, 220, 280, 20, h, nullptr, nullptr, nullptr);
+
+        previewFont = CreateWindowA("STATIC", "MaxRBLX1 Preview",
+                                    WS_VISIBLE | WS_CHILD | SS_OWNERDRAW,
+                                    margin, 240, 600, 50, h, (HMENU)ID_PREVIEW_FONT, nullptr, nullptr);
+
+        int y3 = 300;
+        CreateWindowA("BUTTON", "Browse...", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                      margin, y3, ctrlWidth, ctrlHeight, h, (HMENU)ID_BTN_BROWSE_FONT, nullptr, nullptr);
+
+        CreateWindowA("STATIC", "Size:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
+                      margin + ctrlWidth + gap, y3 + 2, labelWidth, 20, h, nullptr, nullptr, nullptr);
+
+        editFontSize = CreateWindowA("EDIT", std::to_string(selectedFontSize).c_str(),
+                                     WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                                     margin + ctrlWidth + gap + labelWidth + gap, y3, 45, ctrlHeight, h, (HMENU)ID_EDIT_FONTSIZE, nullptr, nullptr);
+
+        CreateWindowA("STATIC", "Text Color:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
+                      margin + ctrlWidth + gap + labelWidth + gap + 55, y3 + 2, 80, 20, h, nullptr, nullptr, nullptr);
+
+        CreateWindowA("BUTTON", "Pick Color", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                      margin + ctrlWidth + gap + labelWidth + gap + 145, y3, ctrlWidth, ctrlHeight, h, (HMENU)ID_BTN_COLOR, nullptr, nullptr);
+
+        int y4 = 340;
+        CreateWindowA("STATIC", "Stroke Color:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
+                      margin, y4 + 2, 90, 20, h, nullptr, nullptr, nullptr);
+
+        CreateWindowA("BUTTON", "Pick Stroke", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                      margin + 100, y4, ctrlWidth, ctrlHeight, h, (HMENU)ID_BTN_STROKE_COLOR, nullptr, nullptr);
+
+        CreateWindowA("STATIC", "Stroke Width:", WS_VISIBLE | WS_CHILD | SS_RIGHT,
+                      margin + 200, y4 + 2, 90, 20, h, nullptr, nullptr, nullptr);
+
+        editStrokeWidth = CreateWindowA("EDIT", std::to_string(selectedStrokeWidth).c_str(),
+                                        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+                                        margin + 300, y4, 45, ctrlHeight, h, nullptr, nullptr, nullptr);
+
+        int y5 = 390;
+        CreateWindowA("BUTTON", "Apply", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+                      230, y5, 80, 28, h, (HMENU)ID_BTN_APPLY, nullptr, nullptr);
+
+        CreateWindowA("BUTTON", "Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                      330, y5, 80, 28, h, (HMENU)IDCANCEL, nullptr, nullptr);
+
+        if (!selectedBg.empty()) {
+            ApplyBackground(previewBg, selectedBg);
+            if (selectedBg.size() > 4) {
+                std::string ext = selectedBg.substr(selectedBg.find_last_of('.') + 1);
+                if (_stricmp(ext.c_str(), "gif") == 0) {
+                    StartGifAnimation(h, previewBg, selectedBg, &gifState);
+                }
+            }
+        }
+
+        if (!selectedFont.empty()) {
+            ApplyFont(previewFont, selectedFont, selectedFontSize);
+        }
+
         return 0;
     }
-    case WM_CTLCOLORSTATIC:
-        if ((HWND)l == previewFont) {
-            SetTextColor((HDC)w, selectedColor);
-            SetBkMode((HDC)w, TRANSPARENT);
-            return (LRESULT)GetStockObject(NULL_BRUSH);
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)l;
+        if (lpDIS->hwndItem == previewBg) {
+            RECT rect = lpDIS->rcItem;
+            HDC hdc = lpDIS->hDC;
+
+            HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(hdc, &rect, blackBrush);
+            DeleteObject(blackBrush);
+
+            if (!selectedBg.empty() && FileExists(selectedBg)) {
+                std::wstring wpath(selectedBg.begin(), selectedBg.end());
+
+                bool isGif = false;
+                std::string ext = selectedBg.substr(selectedBg.find_last_of('.') + 1);
+                if (_stricmp(ext.c_str(), "gif") == 0) {
+                    isGif = true;
+                }
+
+                Image* bgImage = nullptr;
+                if (isGif && gifState.gifImage) {
+                    bgImage = gifState.gifImage;
+                } else {
+                    bgImage = new Image(wpath.c_str());
+                }
+
+                if (bgImage && bgImage->GetLastStatus() == Ok) {
+                    Graphics graphics(hdc);
+                    graphics.SetInterpolationMode(InterpolationModeHighQuality);
+
+                    int imgWidth = bgImage->GetWidth();
+                    int imgHeight = bgImage->GetHeight();
+                    int rectWidth = rect.right - rect.left;
+                    int rectHeight = rect.bottom - rect.top;
+
+                    float scaleX = (float)rectWidth / imgWidth;
+                    float scaleY = (float)rectHeight / imgHeight;
+                    float scale = min(scaleX, scaleY);
+
+                    int drawWidth = (int)(imgWidth * scale);
+                    int drawHeight = (int)(imgHeight * scale);
+                    int drawX = (rectWidth - drawWidth) / 2;
+                    int drawY = (rectHeight - drawHeight) / 2;
+
+                    graphics.DrawImage(bgImage, drawX, drawY, drawWidth, drawHeight);
+
+                    if (!(isGif && gifState.gifImage)) {
+                        delete bgImage;
+                    }
+                }
+            }
+            return TRUE;
+        }
+
+        if (lpDIS->hwndItem == previewFont) {
+            RECT rect = lpDIS->rcItem;
+            HDC hdc = lpDIS->hDC;
+
+            HBRUSH clearBrush = CreateSolidBrush(GetSysColor(COLOR_BTNFACE));
+            FillRect(hdc, &rect, clearBrush);
+            DeleteObject(clearBrush);
+
+            Graphics graphics(hdc);
+            graphics.SetInterpolationMode(InterpolationModeHighQuality);
+            graphics.SetSmoothingMode(SmoothingModeHighQuality);
+
+            std::string faceName = selectedFont;
+            auto pos = faceName.find_last_of("\\/");
+            if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+            pos = faceName.find_last_of('.');
+            if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+
+            std::wstring wfaceName(faceName.begin(), faceName.end());
+
+            FontFamily fontFamily(wfaceName.c_str());
+            Font font(&fontFamily, (REAL)selectedFontSize, FontStyleRegular, UnitPixel);
+
+            const WCHAR* text = L"MaxRBLX1 Preview";
+
+            RectF layoutRect((REAL)rect.left, (REAL)rect.top,
+                           (REAL)(rect.right - rect.left),
+                           (REAL)(rect.bottom - rect.top));
+
+            Color textColor(GetRValue(selectedColor),
+                           GetGValue(selectedColor),
+                           GetBValue(selectedColor));
+
+            Color strokeColor(GetRValue(selectedStrokeColor),
+                             GetGValue(selectedStrokeColor),
+                             GetBValue(selectedStrokeColor));
+
+            DrawTextWithStroke(&graphics, text, &font, layoutRect,
+                              textColor, strokeColor, (REAL)selectedStrokeWidth);
+
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HWND hCtrl = (HWND)l;
+        if (hCtrl != previewBg && hCtrl != previewFont) {
+            return DefWindowProcA(h, m, w, l);
         }
         return DefWindowProcA(h, m, w, l);
+    }
+
     case WM_COMMAND: {
         if (LOWORD(w) == ID_BTN_BROWSE_BG) {
             char file[MAX_PATH] = {0};
             OPENFILENAMEA ofn = { sizeof(ofn) };
             ofn.hwndOwner = h;
-            ofn.lpstrFilter = "Images (*.png;*.jpg;*.jpeg;*.bmp;*.gif)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All Files (*.*)\0*.*\0";
-            ofn.lpstrFile = file; ofn.nMaxFile = sizeof(file);
+            ofn.lpstrFilter = "Animated Images (*.gif;*.png;*.webp)\0*.gif;*.png;*.webp\0All Images (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp\0All Files (*.*)\0*.*\0";
+            ofn.lpstrFile = file;
+            ofn.nMaxFile = sizeof(file);
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn)) { selectedBg = file; ApplyBackground(previewBg, selectedBg); }
-        } else if (LOWORD(w) == ID_BTN_RESET_BG) { selectedBg.clear(); InvalidateRect(previewBg, nullptr, TRUE); }
-        else if (LOWORD(w) == ID_BTN_BROWSE_FONT) {
+            if (GetOpenFileNameA(&ofn)) {
+                selectedBg = file;
+                if (gifState.timerId) {
+                    KillTimer(h, gifState.timerId);
+                    gifState.timerId = 0;
+                }
+                if (gifState.gifImage) {
+                    delete gifState.gifImage;
+                    gifState.gifImage = nullptr;
+                    gifState.isGif = false;
+                }
+                std::string ext = selectedBg.substr(selectedBg.find_last_of('.') + 1);
+                if (_stricmp(ext.c_str(), "gif") == 0) {
+                    StartGifAnimation(h, previewBg, selectedBg, &gifState);
+                }
+                InvalidateRect(previewBg, nullptr, TRUE);
+            }
+        } else if (LOWORD(w) == ID_BTN_RESET_BG) {
+            selectedBg.clear();
+            if (gifState.timerId) {
+                KillTimer(h, gifState.timerId);
+                gifState.timerId = 0;
+            }
+            if (gifState.gifImage) {
+                delete gifState.gifImage;
+                gifState.gifImage = nullptr;
+                gifState.isGif = false;
+            }
+            InvalidateRect(previewBg, nullptr, TRUE);
+        } else if (LOWORD(w) == ID_BTN_BROWSE_FONT) {
             char file[MAX_PATH] = {0};
             OPENFILENAMEA ofn = { sizeof(ofn) };
             ofn.hwndOwner = h;
             ofn.lpstrFilter = "Fonts (*.ttf;*.otf)\0*.ttf;*.otf\0All Files (*.*)\0*.*\0";
-            ofn.lpstrFile = file; ofn.nMaxFile = sizeof(file);
+            ofn.lpstrFile = file;
+            ofn.nMaxFile = sizeof(file);
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
             if (GetOpenFileNameA(&ofn)) {
                 selectedFont = file;
                 AddFontResourceExA(selectedFont.c_str(), FR_PRIVATE, 0);
                 std::string faceName = selectedFont;
-                auto pos = faceName.find_last_of("\\/"); if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
-                pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+                auto pos = faceName.find_last_of("\\/");
+                if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+                pos = faceName.find_last_of('.');
+                if (pos != std::string::npos) faceName = faceName.substr(0, pos);
                 if (hPreviewFontHandle) DeleteObject(hPreviewFontHandle);
                 hPreviewFontHandle = CreateFontA(selectedFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
-                if (hPreviewFontHandle) SendMessageA(previewFont, WM_SETFONT, (WPARAM)hPreviewFontHandle, TRUE);
+                if (hPreviewFontHandle) {
+                    SendMessageA(previewFont, WM_SETFONT, (WPARAM)hPreviewFontHandle, TRUE);
+                }
                 InvalidateRect(previewFont, nullptr, TRUE);
             }
         } else if (LOWORD(w) == ID_BTN_COLOR) {
             CHOOSECOLORA cc = { sizeof(cc) };
-            cc.hwndOwner = h; cc.rgbResult = selectedColor;
+            cc.hwndOwner = h;
+            cc.rgbResult = selectedColor;
             cc.Flags = CC_FULLOPEN | CC_RGBINIT;
-            static COLORREF acrCustClr[16] = {0}; cc.lpCustColors = acrCustClr;
+            static COLORREF acrCustClr[16] = {0};
+            cc.lpCustColors = acrCustClr;
             if (ChooseColorA(&cc)) {
                 selectedColor = cc.rgbResult;
                 InvalidateRect(previewFont, nullptr, TRUE);
+                UpdateWindow(previewFont);
+            }
+        } else if (LOWORD(w) == ID_BTN_STROKE_COLOR) {
+            CHOOSECOLORA cc = { sizeof(cc) };
+            cc.hwndOwner = h;
+            cc.rgbResult = selectedStrokeColor;
+            cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+            static COLORREF acrCustClr[16] = {0};
+            cc.lpCustColors = acrCustClr;
+            if (ChooseColorA(&cc)) {
+                selectedStrokeColor = cc.rgbResult;
+                InvalidateRect(previewFont, nullptr, TRUE);
+                UpdateWindow(previewFont);
+            }
+        } else if (LOWORD(w) == ID_EDIT_FONTSIZE) {
+            char sizeBuf[8];
+            GetWindowTextA(editFontSize, sizeBuf, sizeof(sizeBuf));
+            int newSize = atoi(sizeBuf);
+            if (newSize >= 8 && newSize <= 72) {
+                selectedFontSize = newSize;
+                if (!selectedFont.empty()) {
+                    std::string faceName = selectedFont;
+                    auto pos = faceName.find_last_of("\\/");
+                    if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+                    pos = faceName.find_last_of('.');
+                    if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+                    if (hPreviewFontHandle) DeleteObject(hPreviewFontHandle);
+                    hPreviewFontHandle = CreateFontA(selectedFontSize, 0, 0, 0, FW_NORMAL,
+                        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                        CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
+                    if (hPreviewFontHandle) {
+                        SendMessageA(previewFont, WM_SETFONT, (WPARAM)hPreviewFontHandle, TRUE);
+                    }
+                }
+                InvalidateRect(previewFont, nullptr, TRUE);
             }
         } else if (LOWORD(w) == ID_BTN_APPLY) {
-            char sizeBuf[8]; GetWindowTextA(editFontSize, sizeBuf, sizeof(sizeBuf));
-            int newSize = atoi(sizeBuf);
-            if (newSize >= 8 && newSize <= 72) selectedFontSize = newSize;
+            if (gifState.timerId) {
+                KillTimer(h, gifState.timerId);
+                gifState.timerId = 0;
+            }
+
+            char swBuf[8];
+            GetWindowTextA(editStrokeWidth, swBuf, sizeof(swBuf));
+            int newStrokeWidth = atoi(swBuf);
+            if (newStrokeWidth >= 0 && newStrokeWidth <= 10) {
+                selectedStrokeWidth = newStrokeWidth;
+            }
+
             g_customBackground = selectedBg;
             g_customFont = selectedFont;
             g_customFontSize = selectedFontSize;
             g_customColorRef = selectedColor;
+            g_customStrokeColorRef = selectedStrokeColor;
+            g_customStrokeWidth = selectedStrokeWidth;
             SaveCustomizations();
-            if (g_gifImage) { delete g_gifImage; g_gifImage = nullptr; }
-            if (g_gifTimerId) { KillTimer(g_hWnd, g_gifTimerId); g_gifTimerId = 0; }
+
+            if (gifState.gifImage) {
+                delete gifState.gifImage;
+                gifState.gifImage = nullptr;
+                gifState.isGif = false;
+            }
+
+            if (g_gifImage) {
+                delete g_gifImage;
+                g_gifImage = nullptr;
+            }
+            if (g_gifTimerId) {
+                KillTimer(g_hWnd, g_gifTimerId);
+                g_gifTimerId = 0;
+            }
+            if (g_wicBg.timerId) {
+                KillTimer(g_hWnd, g_wicBg.timerId);
+                g_wicBg.timerId = 0;
+            }
+            g_wicBg.decoder.Reset();
+            g_wicBg.currentFrame.Reset();
+            g_wicBg.isAnimated = false;
             g_backgroundIsGif = false;
+            g_backgroundIsAnimated = false;
             ClearCachedBackground();
-            if (!g_customBackground.empty()) {
+
+            if (!g_customBackground.empty() && FileExists(g_customBackground)) {
                 std::string ext = g_customBackground;
                 auto dot = ext.find_last_of('.');
                 if (dot != std::string::npos) {
                     ext = ext.substr(dot);
-                    if (ext == ".gif" || ext == ".GIF") {
+                    if (_stricmp(ext.c_str(), ".gif") == 0) {
                         g_backgroundIsGif = true;
+                        g_backgroundIsAnimated = true;
                         std::wstring wpath(g_customBackground.begin(), g_customBackground.end());
-                        g_gifImage = new Gdiplus::Image(wpath.c_str());
-                        if (g_gifImage->GetLastStatus() == Gdiplus::Ok) {
-                            GUID pageGuid = Gdiplus::FrameDimensionTime;
+                        g_gifImage = new Image(wpath.c_str());
+                        if (g_gifImage->GetLastStatus() == Ok) {
+                            GUID pageGuid = FrameDimensionTime;
                             g_gifFrameCount = g_gifImage->GetFrameCount(&pageGuid);
                             if (g_gifFrameCount > 1) {
                                 UINT frameDelay = GetGifFrameDelay(g_gifImage, g_gifFrameCount);
                                 g_gifTimerId = SetTimer(g_hWnd, 3001, frameDelay, nullptr);
                             }
+                        }
+                    } else if (_stricmp(ext.c_str(), ".webp") == 0 || _stricmp(ext.c_str(), ".png") == 0) {
+                        if (LoadWicAnimatedBackground(g_customBackground)) {
+                            g_backgroundIsAnimated = true;
                         }
                     }
                 }
@@ -543,16 +1029,48 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(g_hWnd, nullptr, TRUE);
             UpdateWindow(g_hWnd);
             DestroyWindow(h);
-        } else if (LOWORD(w) == IDCANCEL) { DestroyWindow(h); }
+        } else if (LOWORD(w) == IDCANCEL) {
+            if (gifState.timerId) {
+                KillTimer(h, gifState.timerId);
+                gifState.timerId = 0;
+            }
+            if (gifState.gifImage) {
+                delete gifState.gifImage;
+                gifState.gifImage = nullptr;
+                gifState.isGif = false;
+            }
+            DestroyWindow(h);
+        }
         return 0;
     }
+
+    case WM_TIMER:
+        if (w == 3002 && gifState.isGif && gifState.gifImage && gifState.frameCount > 1) {
+            gifState.currentFrame = (gifState.currentFrame + 1) % gifState.frameCount;
+            GUID pageGuid = FrameDimensionTime;
+            gifState.gifImage->SelectActiveFrame(&pageGuid, gifState.currentFrame);
+            InvalidateRect(previewBg, nullptr, TRUE);
+            UpdateWindow(previewBg);
+        }
+        return 0;
+
     case WM_DESTROY:
+        if (gifState.timerId) {
+            KillTimer(h, gifState.timerId);
+            gifState.timerId = 0;
+        }
+        if (gifState.gifImage) {
+            delete gifState.gifImage;
+            gifState.gifImage = nullptr;
+            gifState.isGif = false;
+        }
         if (hPreviewFontHandle) {
             DeleteObject(hPreviewFontHandle);
             hPreviewFontHandle = nullptr;
         }
         g_hSettingsWnd = nullptr;
         return 0;
+
     case WM_NCDESTROY:
         g_hSettingsWnd = nullptr;
         return 0;
@@ -561,7 +1079,10 @@ static LRESULT CALLBACK SettingsWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static void OpenSettingsWindow() {
-    if (g_hSettingsWnd && IsWindow(g_hSettingsWnd)) { SetForegroundWindow(g_hSettingsWnd); return; }
+    if (g_hSettingsWnd && IsWindow(g_hSettingsWnd)) {
+        SetForegroundWindow(g_hSettingsWnd);
+        return;
+    }
     WNDCLASSEXA wc = { sizeof(wc) };
     wc.lpfnWndProc = SettingsWndProc;
     wc.hInstance = GetModuleHandle(nullptr);
@@ -569,12 +1090,20 @@ static void OpenSettingsWindow() {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = "PhantomRecSettings";
     RegisterClassExA(&wc);
+
+    int settingsWidth = 650;
+    int settingsHeight = 460;
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    int x = (screenWidth - settingsWidth) / 2;
+    int y = (screenHeight - settingsHeight) / 2;
+
     g_hSettingsWnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
         "PhantomRecSettings", "Customization",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        (GetSystemMetrics(SM_CXSCREEN) - 640) / 2,
-        (GetSystemMetrics(SM_CYSCREEN) - 480) / 2,
-        640, 480, g_hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
+        x, y,
+        settingsWidth, settingsHeight,
+        g_hWnd, nullptr, GetModuleHandle(nullptr), nullptr);
 }
 
 // ============================================================================
@@ -584,25 +1113,128 @@ static void UpdateUI() {
     std::string hotkey = GetHotkeyName(g_recordHotkey);
     std::string pauseKey = GetHotkeyName(g_pauseHotkey);
 
+    int audioActive = Core_GetAudioStatus(&g_Core);
+    int segmentCount = Core_GetSegmentCount(&g_Core);
+    long long totalBytes = Core_GetTotalBytes(&g_Core);
+    char fileSizeStr[64];
+    Core_FormatSize(totalBytes, fileSizeStr, sizeof(fileSizeStr));
+
+    int displayThreads = g_Core.dynamicThreads;
+    bool isRecording = Core_IsRecording(&g_Core);
+
     if (Core_IsConverting(&g_Core)) {
         DoUpdateButton("Processing...");
-    } else if (Core_IsRecording(&g_Core) && Core_IsPaused(&g_Core)) {
-        DoUpdateButton(("RESUME (" + pauseKey + ")").c_str());
-        DoUpdateStatus("PAUSED");
-    } else if (Core_IsRecording(&g_Core)) {
-        DoUpdateButton(("STOP (" + hotkey + ")").c_str());
-        DoUpdateStatus("Recording...");
-    } else {
-        DoUpdateButton(("START (" + hotkey + ")").c_str());
-        std::string s = "Ready - " + hotkey + " to record\r\n";
-        s += "Pause: " + pauseKey + "\r\n\r\n";
-        s += "Cores: " + std::to_string(g_Core.cpuCoreCount);
-        s += " | Threads: " + std::to_string(g_Core.dynamicThreads);
-        s += "\r\nTarget CRF: " + std::to_string(g_Core.crf);
-        s += "\r\n" + std::to_string(g_Core.screenWidth) + "x" + std::to_string(g_Core.screenHeight);
-        s += "\r\nMax'sEngine(tm) Powered by FFmpeg\r\nBuilt by MaxRBLX1";
-        DoUpdateStatus(s.c_str());
+        ShowWindow(g_progressBar, SW_SHOW);
+        return;
     }
+
+    if (g_progressBar && IsWindow(g_progressBar)) {
+        ShowWindow(g_progressBar, SW_HIDE);
+    }
+
+    if (isRecording) {
+        if (Core_IsPaused(&g_Core)) {
+            DoUpdateButton(("RESUME (" + pauseKey + ")").c_str());
+            char status[512];
+            sprintf_s(status, sizeof(status),
+                "PAUSED\r\n"
+                "Segments: %d\r\n"
+                "Audio: %s\r\n"
+                "Total: %s",
+                segmentCount,
+                audioActive ? "ON" : "OFF",
+                fileSizeStr);
+            DoUpdateStatus(status);
+        } else {
+            DoUpdateButton(("STOP (" + hotkey + ")").c_str());
+            char status[512];
+            sprintf_s(status, sizeof(status),
+                "Recording...\r\n"
+                "Codec: %s\r\n"
+                "Method: %s\r\n"
+                "Resolution: %dx%d\r\n"
+                "Segments: %d\r\n"
+                "Audio: %s\r\n"
+                "Total: %s",
+                "MaxRBLX1's Fastest MJPEG",
+                Core_GetCaptureMethodDesc(&g_Core),
+                g_Core.screenWidth, g_Core.screenHeight,
+                segmentCount,
+                audioActive ? "ON" : "OFF",
+                fileSizeStr);
+            DoUpdateStatus(status);
+        }
+        return;
+    }
+
+    DoUpdateButton(("START (" + hotkey + ")").c_str());
+
+    char status[512];
+    sprintf_s(status, sizeof(status),
+        "Ready - %s to record\r\n"
+        "Pause: %s\r\n"
+        "\r\n"
+        "Cores: %d\r\n"
+        "Threads: %d (conversion)\r\n"
+        "Capture: %s\r\n"
+        "Codec: %s\r\n"
+        "MJPEG Quality: %d\r\n"
+        "CRF: %d\r\n"
+        "Resolution: %dx%d\r\n"
+        "Audio: %s (system loopback)\r\n"
+        "Total recorded: %s\r\n"
+        "\r\n"
+        "Max'sEngine(tm) Powered by FFmpeg\r\n"
+        "Built by MaxRBLX1",
+        hotkey.c_str(),
+        pauseKey.c_str(),
+        g_Core.cpuCoreCount,
+        displayThreads,
+        Core_GetCaptureMethodDesc(&g_Core),
+        "MaxRBLX1's Fastest MJPEG",
+        g_Core.mjpegQuality,
+        g_Core.crf,
+        g_Core.screenWidth, g_Core.screenHeight,
+        audioActive ? "available" : "unavailable",
+        fileSizeStr);
+
+    DoUpdateStatus(status);
+}
+
+// ============================================================================
+// Helper: Draw main UI text with stroke
+// ============================================================================
+static void DrawMainUITextWithStroke(HDC hdc, const RECT& rect, const std::string& text,
+                                      COLORREF textColor, COLORREF strokeColor, int strokeWidth) {
+    Graphics graphics(hdc);
+    graphics.SetInterpolationMode(InterpolationModeHighQuality);
+    graphics.SetSmoothingMode(SmoothingModeHighQuality);
+
+    std::wstring wtext(text.begin(), text.end());
+
+    std::string faceName = g_customFont;
+    if (!faceName.empty()) {
+        auto pos = faceName.find_last_of("\\/");
+        if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+        pos = faceName.find_last_of('.');
+        if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+    } else {
+        faceName = "Segoe UI";
+    }
+
+    std::wstring wfaceName(faceName.begin(), faceName.end());
+    FontFamily fontFamily(wfaceName.c_str());
+    Font font(&fontFamily, (REAL)g_customFontSize, FontStyleRegular, UnitPixel);
+
+    RectF layoutRect((REAL)rect.left, (REAL)rect.top,
+                     (REAL)(rect.right - rect.left),
+                     (REAL)(rect.bottom - rect.top));
+
+    Color colorText(GetRValue(textColor), GetGValue(textColor), GetBValue(textColor));
+    Color colorStroke(GetRValue(strokeColor), GetGValue(strokeColor), GetBValue(strokeColor));
+
+    DrawTextWithStroke(&graphics, wtext.c_str(), &font, layoutRect,
+                       colorText, colorStroke, (REAL)strokeWidth);
 }
 
 // ============================================================================
@@ -663,12 +1295,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                 CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
             if (hFreshFont) {
-                if (g_lblStatus && IsWindow(g_lblStatus)) {
-                    HFONT oldFont = (HFONT)SendMessageA(g_lblStatus, WM_SETFONT, (WPARAM)hFreshFont, TRUE);
-                    if (g_hStatusFont && g_hStatusFont != oldFont && oldFont != (HFONT)GetStockObject(DEFAULT_GUI_FONT))
-                        DeleteObject(g_hStatusFont);
-                    g_hStatusFont = hFreshFont;
-                }
                 if (g_btnRecord && IsWindow(g_btnRecord)) {
                     HFONT oldFont = (HFONT)SendMessageA(g_btnRecord, WM_SETFONT, (WPARAM)hFreshFont, TRUE);
                     if (g_hButtonFont && g_hButtonFont != oldFont && oldFont != (HFONT)GetStockObject(DEFAULT_GUI_FONT))
@@ -686,17 +1312,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         std::string startLabel = "START (" + GetHotkeyName(g_recordHotkey) + ")";
         g_btnRecord = CreateWindowA("BUTTON", startLabel.c_str(),
             WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 20, 20, 340, 50, h, (HMENU)ID_BTN_RECORD, nullptr, nullptr);
-        CreateWindowA("BUTTON", "", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, 360, 5, 30, 30, h, (HMENU)ID_BTN_SETTINGS, nullptr, nullptr);
-        g_lblStatus = CreateWindowA("STATIC", "", WS_VISIBLE | WS_CHILD | SS_LEFT, 20, 120, 340, 130, h, nullptr, nullptr, nullptr);
-        // Fixed: removed PBS_MARQUEE style – now it correctly shows progress position
-        g_progressBar = CreateWindowA("msctls_progress32", "", WS_VISIBLE | WS_CHILD, 20, 260, 340, 15, h, nullptr, nullptr, nullptr);
+
+        g_btnSettings = CreateWindowA("BUTTON", "", WS_VISIBLE | WS_CHILD | BS_OWNERDRAW,
+            360, 5, 30, 30, h, (HMENU)ID_BTN_SETTINGS, nullptr, nullptr);
+
+        g_progressBar = CreateWindowA("msctls_progress32", "", WS_CHILD,
+            20, 260, 340, 15, h, nullptr, nullptr, nullptr);
         SendMessageA(g_progressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-        UINT recMod = GetHotkeyModifiers(g_recordHotkey); RegisterHotKey(h, ID_HOTKEY_RECORD, recMod, g_recordHotkey);
-        UINT pauseMod = GetHotkeyModifiers(g_pauseHotkey); RegisterHotKey(h, ID_HOTKEY_PAUSE, pauseMod, g_pauseHotkey);
+        ShowWindow(g_progressBar, SW_HIDE);
+
+        UINT recMod = GetHotkeyModifiers(g_recordHotkey);
+        RegisterHotKey(h, ID_HOTKEY_RECORD, recMod, g_recordHotkey);
+        UINT pauseMod = GetHotkeyModifiers(g_pauseHotkey);
+        RegisterHotKey(h, ID_HOTKEY_PAUSE, pauseMod, g_pauseHotkey);
+
         SetTimer(h, ID_TIMER_INI_CHECK, 2000, nullptr);
         LoadCustomizations();
         EnsureBackgroundCached();
         UpdateUI();
+
         if (!g_customBackground.empty() && FileExists(g_customBackground)) {
             std::string ext = g_customBackground;
             auto dot = ext.find_last_of('.');
@@ -704,29 +1338,55 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 ext = ext.substr(dot);
                 if (ext == ".gif" || ext == ".GIF") {
                     g_backgroundIsGif = true;
+                    g_backgroundIsAnimated = true;
                     std::wstring wpath(g_customBackground.begin(), g_customBackground.end());
-                    g_gifImage = new Gdiplus::Image(wpath.c_str());
-                    if (g_gifImage->GetLastStatus() == Gdiplus::Ok) {
-                        GUID pageGuid = Gdiplus::FrameDimensionTime;
+                    g_gifImage = new Image(wpath.c_str());
+                    if (g_gifImage->GetLastStatus() == Ok) {
+                        GUID pageGuid = FrameDimensionTime;
                         g_gifFrameCount = g_gifImage->GetFrameCount(&pageGuid);
                         if (g_gifFrameCount > 1) {
                             UINT frameDelay = GetGifFrameDelay(g_gifImage, g_gifFrameCount);
                             g_gifTimerId = SetTimer(h, 3001, frameDelay, nullptr);
                         }
                     }
+                } else if (ext == ".webp" || ext == ".WEBP" || ext == ".png" || ext == ".PNG") {
+                    if (LoadWicAnimatedBackground(g_customBackground)) {
+                        g_backgroundIsAnimated = true;
+                    }
                 }
             }
         }
         return 0;
     }
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT lpDIS = (LPDRAWITEMSTRUCT)l;
+        if (lpDIS->hwndItem == g_btnSettings) {
+            Graphics graphics(lpDIS->hDC);
+            graphics.SetSmoothingMode(SmoothingModeHighQuality);
+            SolidBrush bgBrush(Color(45, 45, 48));
+            graphics.FillRectangle(&bgBrush, 0, 0, 30, 30);
+            FontFamily fontFamily(L"Segoe UI Emoji");
+            Font font(&fontFamily, 16, FontStyleRegular, UnitPixel);
+            SolidBrush textBrush(Color(255, 255, 255));
+            StringFormat format;
+            format.SetAlignment(StringAlignmentCenter);
+            format.SetLineAlignment(StringAlignmentCenter);
+            RectF rect(0, 0, 30, 30);
+            graphics.DrawString(L"⚙", -1, &font, rect, &format, &textBrush);
+            return TRUE;
+        }
+        break;
+    }
+
     case WM_ACTIVATE:
         if (LOWORD(w) == WA_INACTIVE)
             SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         else InvalidateRect(h, nullptr, TRUE);
         return 0;
+
     case WM_CTLCOLORSTATIC: {
         HDC hdcStatic = (HDC)w;
-        // FIX v1.9.6: delete old font before creating new one
         static HFONT hCurrentFont = nullptr;
         static std::string lastFontName = "";
         static int lastFontSize = 0;
@@ -738,8 +1398,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     hCurrentFont = nullptr;
                 }
                 std::string faceName = g_customFont;
-                auto pos = faceName.find_last_of("\\/"); if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
-                pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+                auto pos = faceName.find_last_of("\\/");
+                if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+                pos = faceName.find_last_of('.');
+                if (pos != std::string::npos) faceName = faceName.substr(0, pos);
                 hCurrentFont = CreateFontA(g_customFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
@@ -752,6 +1414,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetTextColor(hdcStatic, g_customColorRef);
         return (LRESULT)GetStockObject(NULL_BRUSH);
     }
+
     case WM_CTLCOLORBTN: {
         HDC hdcBtn = (HDC)w;
         static HFONT hBtnFont = nullptr;
@@ -764,8 +1427,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     hBtnFont = nullptr;
                 }
                 std::string faceName = g_customFont;
-                auto pos = faceName.find_last_of("\\/"); if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
-                pos = faceName.find_last_of('.'); if (pos != std::string::npos) faceName = faceName.substr(0, pos);
+                auto pos = faceName.find_last_of("\\/");
+                if (pos != std::string::npos) faceName = faceName.substr(pos + 1);
+                pos = faceName.find_last_of('.');
+                if (pos != std::string::npos) faceName = faceName.substr(0, pos);
                 hBtnFont = CreateFontA(g_customFontSize, 0, 0, 0, FW_NORMAL,
                     FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, faceName.c_str());
@@ -774,17 +1439,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             if (hBtnFont) SelectObject(hdcBtn, hBtnFont);
         }
-        // return 0 lets the system paint the button
         return 0;
     }
+
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(h, &ps);
         RECT rect;
         GetClientRect(h, &rect);
-        
-        if (g_backgroundIsGif && g_gifImage) {
-            Gdiplus::Graphics graphics(hdc);
+
+        if (g_backgroundIsAnimated && g_wicBg.currentFrame) {
+            DrawWicFrame(hdc, rect);
+        } else if (g_backgroundIsGif && g_gifImage) {
+            Graphics graphics(hdc);
             float imgW = (float)g_gifImage->GetWidth();
             float imgH = (float)g_gifImage->GetHeight();
             float winW = (float)(rect.right - rect.left);
@@ -794,11 +1461,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             float drawH = imgH * scale;
             float drawX = (winW - drawW) / 2.0f;
             float drawY = (winH - drawH) / 2.0f;
-            Gdiplus::SolidBrush blackBrush(Gdiplus::Color(0, 0, 0));
+            SolidBrush blackBrush(Color(0, 0, 0));
             graphics.FillRectangle(&blackBrush, 0, 0, (int)winW, (int)winH);
             graphics.DrawImage(g_gifImage, (int)drawX, (int)drawY, (int)drawW, (int)drawH);
         } else if (g_cachedBgImage) {
-            Gdiplus::Graphics graphics(hdc);
+            Graphics graphics(hdc);
             float imgW = (float)g_cachedBgImage->GetWidth();
             float imgH = (float)g_cachedBgImage->GetHeight();
             float winW = (float)(rect.right - rect.left);
@@ -808,7 +1475,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             float drawH = imgH * scale;
             float drawX = (winW - drawW) / 2.0f;
             float drawY = (winH - drawH) / 2.0f;
-            Gdiplus::SolidBrush blackBrush(Gdiplus::Color(0, 0, 0));
+            SolidBrush blackBrush(Color(0, 0, 0));
             graphics.FillRectangle(&blackBrush, 0, 0, (int)winW, (int)winH);
             graphics.DrawImage(g_cachedBgImage, (int)drawX, (int)drawY, (int)drawW, (int)drawH);
         } else {
@@ -816,10 +1483,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             FillRect(hdc, &rect, hBrush);
             DeleteObject(hBrush);
         }
+
+        RECT statusRect;
+        statusRect.left = 20;
+        statusRect.top = 120;
+        statusRect.right = 360;
+        statusRect.bottom = 250;
+
+        DrawMainUITextWithStroke(hdc, statusRect, g_statusText,
+                                 g_customColorRef, g_customStrokeColorRef, g_customStrokeWidth);
+
         EndPaint(h, &ps);
         return 0;
     }
+
     case WM_ERASEBKGND: return 1;
+
     case WM_COMMAND:
         if (LOWORD(w) == ID_BTN_RECORD) {
             if (Core_IsRecording(&g_Core))
@@ -832,6 +1511,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, TRUE);
         }
         return 0;
+
     case WM_HOTKEY:
         if (w == ID_HOTKEY_RECORD) {
             if (Core_IsRecording(&g_Core))
@@ -844,29 +1524,44 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             UpdateUI();
         }
         return 0;
+
     case WM_TIMER:
         if (w == ID_TIMER_UPDATE) UpdateUI();
         else if (w == ID_TIMER_INI_CHECK) ReloadIniIfChanged();
         else if (w == 3001 && g_gifImage && g_gifFrameCount > 1) {
             g_gifCurrentFrame = (g_gifCurrentFrame + 1) % g_gifFrameCount;
-            GUID pageGuid = Gdiplus::FrameDimensionTime;
+            GUID pageGuid = FrameDimensionTime;
             g_gifImage->SelectActiveFrame(&pageGuid, g_gifCurrentFrame);
             InvalidateRect(h, nullptr, TRUE);
             UpdateWindow(h);
         }
+        else if (w == 3003 && g_wicBg.isAnimated && g_wicBg.decoder) {
+            g_wicBg.currentIndex = (g_wicBg.currentIndex + 1) % g_wicBg.frameCount;
+            g_wicBg.decoder->GetFrame(g_wicBg.currentIndex, &g_wicBg.currentFrame);
+            InvalidateRect(h, nullptr, TRUE);
+            UpdateWindow(h);
+        }
         return 0;
+
     case WM_SYSCOMMAND: {
         UINT sysCmd = (w & 0xFFF0);
-        if (sysCmd == SC_MINIMIZE) { if (g_gifTimerId) { KillTimer(h, g_gifTimerId); g_gifTimerId = 0; } }
+        if (sysCmd == SC_MINIMIZE) {
+            if (g_gifTimerId) { KillTimer(h, g_gifTimerId); g_gifTimerId = 0; }
+            if (g_wicBg.timerId) { KillTimer(h, g_wicBg.timerId); g_wicBg.timerId = 0; }
+        }
         else if (sysCmd == SC_RESTORE) {
             if (g_backgroundIsGif && g_gifImage && g_gifFrameCount > 1 && !g_gifTimerId) {
                 UINT frameDelay = GetGifFrameDelay(g_gifImage, g_gifFrameCount);
                 g_gifTimerId = SetTimer(h, 3001, frameDelay, nullptr);
             }
+            if (g_wicBg.isAnimated && g_wicBg.decoder && !g_wicBg.timerId) {
+                g_wicBg.timerId = SetTimer(h, 3003, g_wicBg.frameDelay, nullptr);
+            }
             InvalidateRect(h, nullptr, TRUE);
         }
         return DefWindowProcA(h, m, w, l);
     }
+
     case WM_DESTROY: {
         if (g_hStatusFont) DeleteObject(g_hStatusFont);
         if (g_hButtonFont) DeleteObject(g_hButtonFont);
@@ -874,13 +1569,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g_hBtnStaticFont) DeleteObject(g_hBtnStaticFont);
 
         if (Core_IsRecording(&g_Core)) Core_StopRecording(&g_Core);
+
         if (g_gifImage) { delete g_gifImage; g_gifImage = nullptr; }
         if (g_gifTimerId) KillTimer(h, g_gifTimerId);
+        if (g_wicBg.timerId) KillTimer(h, g_wicBg.timerId);
+        g_wicBg.decoder.Reset();
+        g_wicBg.currentFrame.Reset();
         ClearCachedBackground();
         UnregisterHotKey(h, ID_HOTKEY_RECORD);
         UnregisterHotKey(h, ID_HOTKEY_PAUSE);
         KillTimer(h, ID_TIMER_INI_CHECK);
-        // Power plan management removed – nothing to restore.
+
+        Core_Shutdown(&g_Core);
+
         PostQuitMessage(0);
         return 0;
     }
@@ -893,21 +1594,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // ============================================================================
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     g_mainThreadId = GetCurrentThreadId();
-    
-    Gdiplus::GdiplusStartupInput gdiplusInput;
-    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
-    
-    // Power plan management removed entirely.
-    
+
+    GdiplusStartupInput gdiplusInput;
+    GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
+
     g_outputDir = GetVideosFolder();
     g_iniPath = GetExeDir() + "\\Settings.ini";
-    
+
     Core_Init(&g_Core, nullptr, g_outputDir.c_str());
     g_Core.onStatusUpdate = OnStatusUpdate;
     g_Core.onButtonUpdate = OnButtonUpdate;
     g_Core.onProgressUpdate = OnProgressUpdate;
     g_Core.onConversionDone = OnConversionDone;
-    
+
     if (!Core_FindMaxsEngine(&g_Core)) {
         MessageBoxA(nullptr,
             "maxsengine.exe not found!\n\n"
@@ -915,60 +1614,91 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
             "or keep ffmpeg.exe for backward compatibility.\n\n"
             "Max'sEngine(tm) Powered by FFmpeg — ffmpeg.org",
             "PhantomRec v" PHANTOMREC_VERSION, MB_OK);
-        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        GdiplusShutdown(g_gdiplusToken);
         return 0;
     }
-    
+	
+	Core_ProbeAudio(&g_Core);
+	
+    if (!g_Core.audioActive && g_Core.maxsoundPath[0] == '\0') {
+        // Only warn if maxsound.exe is missing entirely. If it's present
+        // but the probe failed, that usually means no audio device, which
+        // is normal on headless machines and doesn't need a popup.
+        MessageBoxA(nullptr,
+            "maxsound.exe not found.\n\n"
+            "Recordings will be video-only.\n\n"
+            "Place maxsound.exe next to PhantomRec.exe to capture "
+            "system audio.",
+            "PhantomRec v" PHANTOMREC_VERSION, MB_OK | MB_ICONINFORMATION);
+    }
+
     Core_CleanupOrphanedTempFiles(&g_Core);
-    
+
     if (!FileExists(g_iniPath)) {
         CreateDefaultIni();
         WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath.c_str());
     }
-    
+
     LoadConfiguration();
+
     Core_DetectResolution(&g_Core);
     Core_ConfigurePipeline(&g_Core);
     Core_SetCaptureMethod(&g_Core);
-    Core_WarmEngine(&g_Core);
-    
+
     Sleep(500);
     MessageBeep(MB_ICONINFORMATION);
-    
+
     WNDCLASSEXA wc = { sizeof(wc) };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;
     wc.lpszClassName = "PhantomRecWnd";
+    wc.hIcon = LoadIconA(hInst, MAKEINTRESOURCE(IDI_MAIN_ICON));
+    wc.hIconSm = LoadIconA(hInst, MAKEINTRESOURCE(IDI_MAIN_ICON));
     RegisterClassExA(&wc);
-    
+
     int w = 395, h = 340;
     g_hWnd = CreateWindowExA(WS_EX_TOPMOST | 0x02000000L, "PhantomRecWnd",
-        "PhantomRec v" PHANTOMREC_VERSION " — Max'sEngine(tm)",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        "PhantomRec v" PHANTOMREC_VERSION " - Max'sEngine",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         (GetSystemMetrics(SM_CXSCREEN) - w) / 2,
         (GetSystemMetrics(SM_CYSCREEN) - h) / 2,
         w, h, nullptr, nullptr, hInst, nullptr);
-    
+
     if (!g_hWnd) {
-        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        GdiplusShutdown(g_gdiplusToken);
         return 1;
     }
-    
+
+    HICON hIcon = LoadIconA(hInst, MAKEINTRESOURCE(IDI_MAIN_ICON));
+    if (hIcon) {
+        SendMessageA(g_hWnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+        SendMessageA(g_hWnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+    }
+
     LoadCustomizations();
     EnsureBackgroundCached();
-    
+
     ShowWindow(g_hWnd, nCmdShow);
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    DWORD_PTR ffmpegCoreMask = (DWORD_PTR)1 << (si.dwNumberOfProcessors - 2);
+
+    DWORD_PTR validCoresMask = (DWORD_PTR)((1ULL << si.dwNumberOfProcessors) - 1);
+
+    DWORD_PTR uiAffinityMask = (~ffmpegCoreMask) & validCoresMask;
+
+    SetProcessAffinityMask(GetCurrentProcess(), uiAffinityMask);
     UpdateWindow(g_hWnd);
     PostMessageA(g_hWnd, WM_APP_REFRESH_FONTS, 0, 0);
-    
+
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    
-    Gdiplus::GdiplusShutdown(g_gdiplusToken);
+
+    GdiplusShutdown(g_gdiplusToken);
     return 0;
 }
