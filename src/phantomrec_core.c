@@ -1,8 +1,10 @@
-// phantomrec_core.c — PhantomRec v1.9.7 Pure C Core
+// phantomrec_core.c — PhantomRec v1.9.8 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
-// Direct FFmpeg launch with ffvhuff + YUV420P + single-thread + fast Stage 2
-// Power plan management removed as requested.
+//
+// Stage 1: MaxRBLX1's Fastest MJPEG  (maxenc.exe primary, in-process fallback)
+// Stage 1b: MaxRBLX1's Fastest Sound  (maxsound.exe, WASAPI loopback)
+// Stage 2: x264 ultrafast post-convert.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -12,20 +14,57 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 #include <avrt.h>
 #include <process.h>
-#include <initguid.h>
+#include <tlhelp32.h>
+#include <winreg.h>
+#include <turbojpeg.h>
+#include <libavdevice/avdevice.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 
-#include "phantomrec_core.h"
+#include "phantomrec_coreCopy.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "avrt.lib")
+#pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "advapi32.lib")
+
+#define MAX_BROWSERS 32
+#define MAX_BROWSER_NAME 64
 
 // ============================================================================
-// Internal helpers
+// Globals
 // ============================================================================
+static AVFormatContext* g_fmt_ctx       = NULL;
+static AVStream*        g_video_stream  = NULL;
+static CRITICAL_SECTION g_muxer_lock;
+static HANDLE           g_hCaptureThread = NULL;
+static volatile int     g_captureRunning = 0;
+static tjhandle         g_tjc            = NULL;
+static AVPacket*        g_mjpeg_pkt      = NULL;
 
+// ============================================================================
+// Forward declarations
+// ============================================================================
+static void RestoreAllProcessAffinities(PhantomRecCore* core);
+static void SetAllProcessesAffinityExcludingFFmpegCore(PhantomRecCore* core);
+static unsigned int __stdcall ProcessMonitorThread(void* param);
+static BOOL IsGraphicsProcess(DWORD processId);
+static BOOL IsBrowserProcess(PhantomRecCore* core, DWORD processId);
+static BOOL SendKeyToProcess(DWORD pid, WORD vk, char ch);
+static BOOL WINAPI PhantomCtrlHandler(DWORD type);
+
+// ============================================================================
+// Windows version detection
+// ============================================================================
 static int GetWindowsVersion(void) {
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (!ntdll) return 0;
@@ -40,76 +79,272 @@ static int GetWindowsVersion(void) {
     return 0;
 }
 
-static void GetCaptureFilter(const PhantomRecCore* core, char* buf, int bufsize) {
-    if (core->captureMethod == 0 || core->captureMethod == 1) {
-        strncpy_s(buf, bufsize, " -vf \"hwdownload,format=bgra,format=yuv420p\"", _TRUNCATE);
-    } else {
-        strncpy_s(buf, bufsize, " -vf \"format=yuv420p\"", _TRUNCATE);
+// ============================================================================
+// In-process MJPEG encode + mux
+// ============================================================================
+static unsigned char* EncodeFrameToMJPEG(tjhandle tjc,
+                                         const unsigned char* bgrx,
+                                         int w, int h, int stride,
+                                         int quality, unsigned long* out_size)
+{
+    unsigned char* jpeg = NULL;
+    int ret = tjCompress2(tjc, (unsigned char*)bgrx, w, stride, h,
+                          TJPF_BGRX, &jpeg, out_size,
+                          TJSAMP_420, quality, TJFLAG_FASTDCT);
+    if (ret != 0 || !jpeg) { *out_size = 0; return NULL; }
+    return jpeg;
+}
+
+static int MuxJPEGFrame(PhantomRecCore* core, const unsigned char* bgrx,
+                        int w, int h, int stride)
+{
+    if (!g_tjc || !g_fmt_ctx || !g_video_stream || !g_mjpeg_pkt) return -1;
+    if (InterlockedCompareExchange(&core->paused, 1, 1) == 1) return 0;
+
+    int quality = (core->mjpegQuality >= 1 && core->mjpegQuality <= 100)
+                    ? core->mjpegQuality : 75;
+
+    unsigned long jpeg_size = 0;
+    unsigned char* jpeg = EncodeFrameToMJPEG(g_tjc, bgrx, w, h, stride, quality, &jpeg_size);
+    if (!jpeg || jpeg_size == 0) return -1;
+
+    AVPacket* pkt = g_mjpeg_pkt;
+    av_packet_unref(pkt);
+
+    pkt->data = jpeg;
+    pkt->size = (int)jpeg_size;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    int64_t elapsed_us = (int64_t)((now.QuadPart - core->segmentStartTime.QuadPart)
+                                   * 1000000 / core->recFreq.QuadPart);
+
+    pkt->pts = elapsed_us;
+    pkt->dts = elapsed_us;
+    pkt->stream_index = g_video_stream->index;
+    av_packet_rescale_ts(pkt, (AVRational){1, 1000000}, g_video_stream->time_base);
+
+    EnterCriticalSection(&g_muxer_lock);
+    av_interleaved_write_frame(g_fmt_ctx, pkt);
+    LeaveCriticalSection(&g_muxer_lock);
+
+    tjFree(jpeg);
+    av_packet_unref(pkt);
+    return 0;
+}
+
+// ============================================================================
+// Keyboard send to console child
+// ============================================================================
+static BOOL SendKeyToProcess(DWORD pid, WORD vk, char ch) {
+    FreeConsole();
+    if (!AttachConsole(pid)) return FALSE;
+    BOOL ok = FALSE;
+    HANDLE hIn = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             NULL, OPEN_EXISTING, 0, NULL);
+    if (hIn != INVALID_HANDLE_VALUE) {
+        INPUT_RECORD ir[2] = {0};
+        ir[0].EventType = KEY_EVENT;
+        ir[0].Event.KeyEvent.bKeyDown = TRUE;
+        ir[0].Event.KeyEvent.wRepeatCount = 1;
+        ir[0].Event.KeyEvent.wVirtualKeyCode = vk;
+        ir[0].Event.KeyEvent.uChar.AsciiChar = ch;
+        ir[1].EventType = KEY_EVENT;
+        ir[1].Event.KeyEvent.bKeyDown = TRUE;
+        ir[1].Event.KeyEvent.wRepeatCount = 1;
+        ir[1].Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
+        ir[1].Event.KeyEvent.uChar.AsciiChar = '\r';
+        DWORD written = 0;
+        ok = WriteConsoleInputA(hIn, ir, 2, &written) != 0;
+        CloseHandle(hIn);
     }
+    FreeConsole();
+    return ok;
 }
 
 // ============================================================================
-// Helper: close console window of given process ID
+// Video child spawn / stop (maxenc.exe)
 // ============================================================================
+static BOOL SpawnVideoChild(const char* cmdline, PROCESS_INFORMATION* pi) {
+    STARTUPINFOA si = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
 
-static BOOL CALLBACK CloseConsoleWindowEnumProc(HWND hwnd, LPARAM lParam) {
-    DWORD pid = (DWORD)lParam;
-    DWORD windowPid;
-    GetWindowThreadProcessId(hwnd, &windowPid);
-    if (windowPid == pid) {
-        char className[64];
-        GetClassNameA(hwnd, className, sizeof(className));
-        if (strcmp(className, "ConsoleWindowClass") == 0) {
-            PostMessageA(hwnd, WM_CLOSE, 0, 0);
-            return FALSE;
-        }
+    char* buf = _strdup(cmdline);
+    if (!buf) return FALSE;
+
+    BOOL ok = CreateProcessA(
+        NULL, buf, NULL, NULL, FALSE,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | ABOVE_NORMAL_PRIORITY_CLASS,
+        NULL, NULL, &si, pi);
+
+    free(buf);
+    return ok;
+}
+
+static void StopVideoChild(PROCESS_INFORMATION* pi, DWORD timeoutMs) {
+    if (!pi->hProcess) return;
+
+    SendKeyToProcess(pi->dwProcessId, 'Q', 'q');
+    if (WaitForSingleObject(pi->hProcess, timeoutMs) == WAIT_OBJECT_0) {
+        CloseHandle(pi->hProcess);
+        CloseHandle(pi->hThread);
+        memset(pi, 0, sizeof(*pi));
+        return;
     }
-    return TRUE;
-}
 
-static void CloseConsoleWindow(DWORD pid) {
-    if (pid) EnumWindows(CloseConsoleWindowEnumProc, (LPARAM)pid);
-}
-
-// ============================================================================
-// Hard Stop FFmpeg Process (v1.9.6 - Bulletproof with timeout)
-// ============================================================================
-
-static void StopFFmpegProcess(PhantomRecCore* core, DWORD timeoutMs) {
-    if (!core->ffmpegProcess.hProcess) return;
-
-    DWORD pid = core->ffmpegProcess.dwProcessId;
-    HANDLE hProcess = core->ffmpegProcess.hProcess;
-
-    if (AttachConsole(pid)) {
-        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0);
-        Sleep(timeoutMs);
+    if (AttachConsole(pi->dwProcessId)) {
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pi->dwProcessId);
         FreeConsole();
     }
-
-    DWORD exitCode;
-    if (GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE) {
-        if (AttachConsole(pid)) {
-            GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
-            Sleep(timeoutMs);
-            FreeConsole();
-        }
+    if (WaitForSingleObject(pi->hProcess, 800) == WAIT_OBJECT_0) {
+        CloseHandle(pi->hProcess);
+        CloseHandle(pi->hThread);
+        memset(pi, 0, sizeof(*pi));
+        return;
     }
 
-    if (GetExitCodeProcess(hProcess, &exitCode) && exitCode == STILL_ACTIVE) {
-        TerminateProcess(hProcess, 0);
-        WaitForSingleObject(hProcess, 1000);
+    if (AttachConsole(pi->dwProcessId)) {
+        GenerateConsoleCtrlEvent(CTRL_C_EVENT, pi->dwProcessId);
+        FreeConsole();
+    }
+    if (WaitForSingleObject(pi->hProcess, 800) == WAIT_OBJECT_0) {
+        CloseHandle(pi->hProcess);
+        CloseHandle(pi->hThread);
+        memset(pi, 0, sizeof(*pi));
+        return;
     }
 
-    CloseHandle(hProcess);
-    CloseHandle(core->ffmpegProcess.hThread);
-    memset(&core->ffmpegProcess, 0, sizeof(core->ffmpegProcess));
+    TerminateProcess(pi->hProcess, 0);
+    WaitForSingleObject(pi->hProcess, 500);
+    CloseHandle(pi->hProcess);
+    CloseHandle(pi->hThread);
+    memset(pi, 0, sizeof(*pi));
 }
 
 // ============================================================================
-// Capture Method Management
+// maxsound.exe child — spawn / stop
 // ============================================================================
+static BOOL SpawnMaxSound(PhantomRecCore* core, const char* wavPath,
+                          const char* markerPath, PROCESS_INFORMATION* pi) {
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "\"%s\" \"%s\" --marker \"%s\"",
+             core->maxsoundPath, wavPath, markerPath);
 
+    STARTUPINFOA si = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    char* buf = _strdup(cmd);
+    if (!buf) return FALSE;
+
+    BOOL ok = CreateProcessA(
+        NULL, buf, NULL, NULL, FALSE,
+        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | ABOVE_NORMAL_PRIORITY_CLASS,
+        NULL, NULL, &si, pi);
+
+    free(buf);
+    return ok;
+}
+
+static void StopMaxSound(PROCESS_INFORMATION* pi, DWORD timeoutMs) {
+    if (!pi->hProcess) return;
+
+    SendKeyToProcess(pi->dwProcessId, 'Q', 'q');
+    if (WaitForSingleObject(pi->hProcess, timeoutMs) == WAIT_OBJECT_0) {
+        CloseHandle(pi->hProcess);
+        CloseHandle(pi->hThread);
+        memset(pi, 0, sizeof(*pi));
+        return;
+    }
+
+    if (AttachConsole(pi->dwProcessId)) {
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pi->dwProcessId);
+        FreeConsole();
+    }
+    if (WaitForSingleObject(pi->hProcess, 800) == WAIT_OBJECT_0) {
+        CloseHandle(pi->hProcess);
+        CloseHandle(pi->hThread);
+        memset(pi, 0, sizeof(*pi));
+        return;
+    }
+
+    TerminateProcess(pi->hProcess, 0);
+    WaitForSingleObject(pi->hProcess, 500);
+    CloseHandle(pi->hProcess);
+    CloseHandle(pi->hThread);
+    memset(pi, 0, sizeof(*pi));
+}
+
+static void DeleteFileWithRetry(const char* path) {
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (DeleteFileA(path)) return;
+        Sleep(100);
+    }
+}
+
+// ============================================================================
+// .t0 marker helpers
+// ============================================================================
+static int64_t ReadT0Marker(const char* file) {
+    char markerPath[MAX_PATH];
+    snprintf(markerPath, sizeof(markerPath), "%s.t0", file);
+
+    HANDLE h = CreateFileA(markerPath, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int64_t tick = 0;
+    DWORD got = 0;
+    ReadFile(h, &tick, sizeof(tick), &got, NULL);
+    CloseHandle(h);
+    if (got != sizeof(tick)) return 0;
+    return tick;
+}
+
+static int64_t WaitT0Marker(const char* file, DWORD timeoutMs) {
+    DWORD elapsed = 0;
+    while (elapsed < timeoutMs) {
+        int64_t t = ReadT0Marker(file);
+        if (t != 0) return t;
+        Sleep(20);
+        elapsed += 20;
+    }
+    return 0;
+}
+
+static int QpcDeltaToMs(PhantomRecCore* core, int64_t audioTick, int64_t videoTick) {
+    if (core->recFreq.QuadPart == 0) return 0;
+    LONGLONG delta = (LONGLONG)(audioTick - videoTick);
+    LONGLONG ms = delta * 1000 / core->recFreq.QuadPart;
+    if (ms >  30000) ms =  30000;
+    if (ms < -30000) ms = -30000;
+    return (int)ms;
+}
+
+// ============================================================================
+// CPU affinity
+// ============================================================================
+static DWORD_PTR GetSecondLastCoreAffinityMask(void) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    if (si.dwNumberOfProcessors >= 4) {
+        return ((DWORD_PTR)1 << (si.dwNumberOfProcessors - 1)) |
+               ((DWORD_PTR)1 << (si.dwNumberOfProcessors - 2));
+    } else if (si.dwNumberOfProcessors >= 2) {
+        return (DWORD_PTR)1 << (si.dwNumberOfProcessors - 2);
+    }
+    return (DWORD_PTR)1;
+}
+
+// ============================================================================
+// Capture method
+// ============================================================================
 static CaptureMethod g_UserCaptureMethod = CAPTURE_AUTO;
 
 void Core_SetCaptureMethodEx(PhantomRecCore* core, CaptureMethod method) {
@@ -130,17 +365,14 @@ static void GetCaptureInput(PhantomRecCore* core, char* buf, int bufsize) {
     int winVer = GetWindowsVersion();
     CaptureMethod method = g_UserCaptureMethod;
     if (method == CAPTURE_AUTO) {
-        if (winVer >= 10) {
-            method = (core->cpuCoreCount >= 8) ? CAPTURE_GFX : CAPTURE_DDAGRAB;
-        } else if (winVer >= 8) {
-            method = CAPTURE_DDAGRAB;
-        } else {
-            method = CAPTURE_GDI;
-        }
+        if (winVer >= 10) method = (core->cpuCoreCount >= 8) ? CAPTURE_GFX : CAPTURE_DDAGRAB;
+        else if (winVer >= 8) method = CAPTURE_DDAGRAB;
+        else method = CAPTURE_GDI;
     }
-    // fallback chain
     if (method == CAPTURE_GFX && winVer < 10) method = CAPTURE_DDAGRAB;
     if (method == CAPTURE_DDAGRAB && winVer < 8) method = CAPTURE_GDI;
+
+    int captureFPS = (core->cpuCoreCount >= 4) ? 60 : 30;
 
     switch (method) {
     case CAPTURE_GFX:
@@ -149,20 +381,19 @@ static void GetCaptureInput(PhantomRecCore* core, char* buf, int bufsize) {
         break;
     case CAPTURE_DDAGRAB:
         core->captureMethod = 1;
-        strncpy_s(buf, bufsize, " -f lavfi -i ddagrab=0:framerate=60", _TRUNCATE);
+        sprintf_s(buf, bufsize, " -f lavfi -i ddagrab=0:framerate=%d", captureFPS);
         break;
     case CAPTURE_GDI:
     default:
         core->captureMethod = 2;
-        strncpy_s(buf, bufsize, " -f gdigrab -framerate 60 -i desktop", _TRUNCATE);
+        sprintf_s(buf, bufsize, " -f gdigrab -framerate %d -i desktop", captureFPS);
         break;
     }
 }
 
 // ============================================================================
-// Utility functions
+// Utility
 // ============================================================================
-
 int Core_FileExists(const char* path) {
     DWORD attr = GetFileAttributesA(path);
     return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
@@ -219,204 +450,276 @@ int Core_FindMaxsEngine(PhantomRecCore* core) {
     char* lastSep = strrchr(local, '\\');
     if (lastSep) *lastSep = '\0';
     char testPath[MAX_PATH];
+
     sprintf_s(testPath, MAX_PATH, "%s\\maxsengine.exe", local);
     if (Core_FileExists(testPath)) {
         strncpy_s(core->maxsenginePath, MAX_PATH, testPath, _TRUNCATE);
-        return 1;
-    }
-    sprintf_s(testPath, MAX_PATH, "%s\\ffmpeg.exe", local);
-    if (Core_FileExists(testPath)) {
-        strncpy_s(core->maxsenginePath, MAX_PATH, testPath, _TRUNCATE);
-        return 1;
-    }
-    return 0;
-}
-
-// ============================================================================
-// WASAPI Audio Capture (unchanged)
-// ============================================================================
-
-static int InitializeWASAPI(PhantomRecCore* core) {
-    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE) return 0;
-    IMMDeviceEnumerator* enumerator = NULL;
-    IMMDevice* device = NULL;
-    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-        &IID_IMMDeviceEnumerator, (void**)&enumerator);
-    if (FAILED(hr)) { CoUninitialize(); return 0; }
-    hr = enumerator->lpVtbl->GetDefaultAudioEndpoint(enumerator, eRender, eConsole, &device);
-    if (FAILED(hr)) { enumerator->lpVtbl->Release(enumerator); CoUninitialize(); return 0; }
-    hr = device->lpVtbl->Activate(device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&core->audioClient);
-    device->lpVtbl->Release(device);
-    enumerator->lpVtbl->Release(enumerator);
-    if (FAILED(hr)) { CoUninitialize(); return 0; }
-    hr = core->audioClient->lpVtbl->GetMixFormat(core->audioClient, &core->waveFormat);
-    if (FAILED(hr)) {
-        core->audioClient->lpVtbl->Release(core->audioClient);
-        core->audioClient = NULL;
-        CoUninitialize();
-        return 0;
-    }
-    core->hAudioReadyEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
-    if (!core->hAudioReadyEvent) {
-        CoTaskMemFree(core->waveFormat);
-        core->waveFormat = NULL;
-        core->audioClient->lpVtbl->Release(core->audioClient);
-        core->audioClient = NULL;
-        CoUninitialize();
-        return 0;
-    }
-    hr = core->audioClient->lpVtbl->Initialize(core->audioClient,
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        0, 0, core->waveFormat, NULL);
-    if (FAILED(hr)) {
-        CoTaskMemFree(core->waveFormat); core->waveFormat = NULL;
-        core->audioClient->lpVtbl->Release(core->audioClient); core->audioClient = NULL;
-        CloseHandle(core->hAudioReadyEvent); core->hAudioReadyEvent = NULL;
-        CoUninitialize();
-        return 0;
-    }
-    core->audioClient->lpVtbl->SetEventHandle(core->audioClient, core->hAudioReadyEvent);
-    core->audioClient->lpVtbl->GetService(core->audioClient, &IID_IAudioCaptureClient, (void**)&core->captureClient);
-    if (core->waveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        WAVEFORMATEXTENSIBLE* ex = (WAVEFORMATEXTENSIBLE*)core->waveFormat;
-        core->audioBitsPerSample = (IsEqualGUID(&ex->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) ? 32 : 16;
-    } else if (core->waveFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        core->audioBitsPerSample = 32;
     } else {
-        core->audioBitsPerSample = 16;
+        sprintf_s(testPath, MAX_PATH, "%s\\ffmpeg.exe", local);
+        if (Core_FileExists(testPath)) {
+            strncpy_s(core->maxsenginePath, MAX_PATH, testPath, _TRUNCATE);
+        } else {
+            return 0;
+        }
     }
-    core->audioClient->lpVtbl->Start(core->audioClient);
-    core->audioActive = 1;
+
+    sprintf_s(testPath, MAX_PATH, "%s\\maxenc.exe", local);
+    if (Core_FileExists(testPath)) {
+        strncpy_s(core->maxencPath, MAX_PATH, testPath, _TRUNCATE);
+    } else {
+        core->maxencPath[0] = '\0';
+    }
+
+    sprintf_s(testPath, MAX_PATH, "%s\\maxsound.exe", local);
+    if (Core_FileExists(testPath)) {
+        strncpy_s(core->maxsoundPath, MAX_PATH, testPath, _TRUNCATE);
+    } else {
+        core->maxsoundPath[0] = '\0';
+    }
+
     return 1;
 }
 
-static void CleanupWASAPI(PhantomRecCore* core) {
-    if (core->audioActive) {
-        core->audioClient->lpVtbl->Stop(core->audioClient);
-        if (core->captureClient) { core->captureClient->lpVtbl->Release(core->captureClient); core->captureClient = NULL; }
-        if (core->audioClient) { core->audioClient->lpVtbl->Release(core->audioClient); core->audioClient = NULL; }
-        if (core->waveFormat) { CoTaskMemFree(core->waveFormat); core->waveFormat = NULL; }
-        if (core->hAudioReadyEvent) { CloseHandle(core->hAudioReadyEvent); core->hAudioReadyEvent = NULL; }
-        core->audioActive = 0;
-        CoUninitialize();
+// ============================================================================
+// Browser detection
+// ============================================================================
+static int GetInstalledBrowsers(char browserNames[][MAX_BROWSER_NAME], int maxBrowsers) {
+    HKEY hKey;
+    int browserCount = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Clients\\StartMenuInternet",
+                      0, KEY_READ, &hKey) != ERROR_SUCCESS) return 0;
+    DWORD index = 0;
+    char browserName[MAX_PATH];
+    DWORD nameSize = sizeof(browserName);
+    while (browserCount < maxBrowsers &&
+           RegEnumKeyExA(hKey, index, browserName, &nameSize,
+                        NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+        HKEY hBrowserKey;
+        char subKeyPath[MAX_PATH];
+        sprintf_s(subKeyPath, sizeof(subKeyPath),
+                  "SOFTWARE\\Clients\\StartMenuInternet\\%s\\shell\\open\\command",
+                  browserName);
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKeyPath, 0, KEY_READ, &hBrowserKey) == ERROR_SUCCESS) {
+            char commandLine[MAX_PATH * 2];
+            DWORD commandSize = sizeof(commandLine);
+            if (RegQueryValueExA(hBrowserKey, NULL, NULL, NULL,
+                                 (LPBYTE)commandLine, &commandSize) == ERROR_SUCCESS) {
+                char* exeStart = strrchr(commandLine, '\\');
+                if (exeStart) {
+                    exeStart++;
+                    char* exeEnd = strstr(exeStart, ".exe");
+                    if (exeEnd) {
+                        exeEnd += 4;
+                        int nameLen = (int)(exeEnd - exeStart);
+                        if (nameLen < MAX_BROWSER_NAME) {
+                            strncpy_s(browserNames[browserCount], MAX_BROWSER_NAME, exeStart, nameLen);
+                            browserCount++;
+                        }
+                    }
+                }
+            }
+            RegCloseKey(hBrowserKey);
+        }
+        index++;
+        nameSize = sizeof(browserName);
     }
+    RegCloseKey(hKey);
+    return browserCount;
+}
+
+static BOOL IsBrowserProcess(PhantomRecCore* core, DWORD processId) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+    if (!hProcess) return FALSE;
+    char processPath[MAX_PATH];
+    DWORD pathSize = sizeof(processPath);
+    BOOL isBrowser = FALSE;
+    if (QueryFullProcessImageNameA(hProcess, 0, processPath, &pathSize)) {
+        char* fileName = strrchr(processPath, '\\');
+        if (fileName) fileName++; else fileName = processPath;
+        char lowerName[MAX_PATH];
+        for (int j = 0; fileName[j] && j < MAX_PATH - 1; j++) {
+            lowerName[j] = (char)tolower(fileName[j]);
+            lowerName[j + 1] = '\0';
+        }
+        for (int i = 0; i < core->browserCount; i++) {
+            char lowerBrowser[MAX_BROWSER_NAME];
+            for (int j = 0; core->browserNames[i][j] && j < MAX_BROWSER_NAME - 1; j++) {
+                lowerBrowser[j] = (char)tolower(core->browserNames[i][j]);
+                lowerBrowser[j + 1] = '\0';
+            }
+            if (strcmp(lowerName, lowerBrowser) == 0) { isBrowser = TRUE; break; }
+        }
+    }
+    CloseHandle(hProcess);
+    return isBrowser;
+}
+
+static BOOL IsGameProcess(PhantomRecCore* core, DWORD processId) {
+    if (IsBrowserProcess(core, processId)) return FALSE;
+    return IsGraphicsProcess(processId);
 }
 
 // ============================================================================
-// Audio capture thread (unchanged)
+// Process monitor
 // ============================================================================
-
-static unsigned int __stdcall AudioToPipeThread(void* param) {
+static unsigned int __stdcall ProcessMonitorThread(void* param) {
     PhantomRecCore* core = (PhantomRecCore*)param;
-    DWORD taskIndex = 0;
-    HANDLE hAvrt = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
-    WaitForSingleObject(core->hAudioStartEvent, INFINITE);
-    UINT32 packetLength = 0;
-    while (InterlockedCompareExchange(&core->recording, 1, 1) == 1) {
-        while (InterlockedCompareExchange(&core->paused, 1, 1) == 1 && InterlockedCompareExchange(&core->recording, 1, 1) == 1) { Sleep(100); }
-        if (InterlockedCompareExchange(&core->recording, 1, 1) == 0) break;
-        DWORD waitResult = WaitForSingleObject(core->hAudioReadyEvent, 1000);
-        if (waitResult != WAIT_OBJECT_0) {
-            if (InterlockedCompareExchange(&core->recording, 1, 1) == 0) break;
-            continue;
-        }
-        HRESULT hr = core->captureClient->lpVtbl->GetNextPacketSize(core->captureClient, &packetLength);
-        if (FAILED(hr)) break;
-        while (packetLength > 0) {
-            BYTE* data;
-            UINT32 frames;
-            DWORD flags;
-            UINT64 devicePosition = 0, qpcTimestamp = 0;
-            hr = core->captureClient->lpVtbl->GetBuffer(core->captureClient, &data, &frames, &flags, &devicePosition, &qpcTimestamp);
-            if (SUCCEEDED(hr)) {
-                size_t size = frames * core->waveFormat->nBlockAlign;
-                BYTE* writeData = data;
-                BYTE* silenceBuf = NULL;
-                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                    silenceBuf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, size);
-                    if (silenceBuf) {
-                        memset(silenceBuf, 0, size);
-                        writeData = silenceBuf;
+    while (core->processMonitorRunning) {
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe32;
+            pe32.dwSize = sizeof(PROCESSENTRY32);
+            if (Process32First(hSnapshot, &pe32)) {
+                do {
+                    if (pe32.th32ProcessID == 0 ||
+                        pe32.th32ProcessID == GetCurrentProcessId() ||
+                        pe32.th32ProcessID == core->ffmpegProcess.dwProcessId ||
+                        pe32.th32ProcessID == core->ffmpegAudioProcess.dwProcessId) continue;
+                    if (IsGameProcess(core, pe32.th32ProcessID)) {
+                        HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
+                                                      FALSE, pe32.th32ProcessID);
+                        if (hProcess) {
+                            DWORD_PTR processAffinity, systemAffinity;
+                            if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity)) {
+                                DWORD_PTR newAffinity = processAffinity & ~core->ffmpegCoreMask;
+                                if (newAffinity != 0 && newAffinity != processAffinity)
+                                    SetProcessAffinityMask(hProcess, newAffinity);
+                            }
+                            CloseHandle(hProcess);
+                        }
                     }
-                }
-                DWORD written = 0;
-                WriteFile(core->hAudioPipeWrite, writeData, (DWORD)size, &written, NULL);
-                core->captureClient->lpVtbl->ReleaseBuffer(core->captureClient, frames);
-                if (silenceBuf) HeapFree(GetProcessHeap(), 0, silenceBuf);
+                } while (Process32Next(hSnapshot, &pe32));
             }
-            hr = core->captureClient->lpVtbl->GetNextPacketSize(core->captureClient, &packetLength);
-            if (FAILED(hr)) break;
+            CloseHandle(hSnapshot);
         }
+        Sleep(1000);
     }
-    if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
     return 0;
 }
 
-// ============================================================================
-// Build FFmpeg command line (NO cmd.exe wrapper)
-// ============================================================================
-
-static void BuildCaptureCommand(PhantomRecCore* core, const char* outputFile, int hasAudio, char* cmdLine, int cmdSize) {
-    char captureInput[512];
-    char captureFilter[256];
-    GetCaptureInput(core, captureInput, sizeof(captureInput));
-    GetCaptureFilter(core, captureFilter, sizeof(captureFilter));
-    const char* rtbufsize = "2048M";
-
-    // Single-threaded encoding - no game core contention
-    core->dynamicThreads = 1;
-
-    int vq = (core->videoQueueSize > 0) ? core->videoQueueSize : 4096;
-
-    int offset = sprintf_s(cmdLine, cmdSize,
-        "\"%s\" -y -hide_banner -loglevel error"
-        " -rtbufsize %s"
-        " -thread_queue_size %d"
-        "%s",
-        core->maxsenginePath, rtbufsize, vq, captureInput);
-
-    if (hasAudio) {
-        offset += sprintf_s(cmdLine + offset, cmdSize - offset,
-            " -itsoffset 0.0 -thread_queue_size %d -f %s -ar %d -ac %d -i pipe:0",
-            vq, core->audioFormat, core->audioSampleRate, core->audioChannels);
+static void SetAllProcessesAffinityExcludingFFmpegCore(PhantomRecCore* core) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == 0 || pe32.th32ProcessID == GetCurrentProcessId()) continue;
+            if (IsGameProcess(core, pe32.th32ProcessID)) {
+                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
+                                              FALSE, pe32.th32ProcessID);
+                if (hProcess) {
+                    DWORD_PTR processAffinity, systemAffinity;
+                    if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity)) {
+                        DWORD_PTR newAffinity = processAffinity & ~core->ffmpegCoreMask;
+                        if (newAffinity != 0 && newAffinity != processAffinity)
+                            SetProcessAffinityMask(hProcess, newAffinity);
+                    }
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
     }
-
-    offset += sprintf_s(cmdLine + offset, cmdSize - offset,
-        "%s"
-        " -fps_mode passthrough"
-        " -max_muxing_queue_size 2147483647"
-        " -c:v ffvhuff -pred left -threads 1 -pix_fmt yuv420p",
-        captureFilter);
-
-    if (hasAudio) {
-        offset += sprintf_s(cmdLine + offset, cmdSize - offset, " -c:a copy");
-    }
-
-    sprintf_s(cmdLine + offset, cmdSize - offset,
-        " -fflags +genpts -f matroska \"%s\"",
-        outputFile);
+    CloseHandle(hSnapshot);
 }
 
 // ============================================================================
-// Recording engine
+// Command builders
 // ============================================================================
+static void BuildMaxEncCommand(PhantomRecCore* core, const char* outputFile,
+                               char* cmdLine, int cmdSize) {
+    const char* apiStr = "auto";
+    switch (core->captureMethod) {
+    case 0: apiStr = "gfx";     break;
+    case 1: apiStr = "ddagrab"; break;
+    case 2: apiStr = "gdi";     break;
+    default: apiStr = "auto";   break;
+    }
+    int quality = (core->mjpegQuality >= 1 && core->mjpegQuality <= 100)
+                    ? core->mjpegQuality : 75;
 
+    sprintf_s(cmdLine, cmdSize,
+        "\"%s\" \"%s\" %d %s \"%s\"",
+        core->maxencPath, outputFile, quality, apiStr, core->maxsenginePath);
+}
+
+// ============================================================================
+// Graphics process detection
+// ============================================================================
+static BOOL IsGraphicsProcess(DWORD processId) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
+    MODULEENTRY32 me32;
+    me32.dwSize = sizeof(MODULEENTRY32);
+    BOOL isGraphics = FALSE;
+    if (Module32First(hSnapshot, &me32)) {
+        do {
+            char lowerName[MAX_PATH];
+            for (int j = 0; me32.szModule[j] && j < MAX_PATH - 1; j++) {
+                lowerName[j] = (char)tolower(me32.szModule[j]);
+                lowerName[j + 1] = '\0';
+            }
+            if (strstr(lowerName, "d3d") || strstr(lowerName, "dxgi") ||
+                strstr(lowerName, "opengl") || strstr(lowerName, "vulkan") ||
+                strstr(lowerName, "gles") || strstr(lowerName, "egl")) {
+                isGraphics = TRUE;
+                break;
+            }
+        } while (Module32Next(hSnapshot, &me32));
+    }
+    CloseHandle(hSnapshot);
+    return isGraphics;
+}
+
+// ============================================================================
+// Core lifecycle
+// ============================================================================
 void Core_Init(PhantomRecCore* core, const char* maxsenginePath, const char* outputDir) {
+	SetConsoleCtrlHandler(PhantomCtrlHandler, TRUE);
     memset(core, 0, sizeof(PhantomRecCore));
     if (maxsenginePath) strncpy_s(core->maxsenginePath, MAX_PATH, maxsenginePath, _TRUNCATE);
     if (outputDir) strncpy_s(core->outputDir, MAX_PATH, outputDir, _TRUNCATE);
     core->convertAfterRecording = 1;
     core->pipeBufferSizeMB = 8;
     core->dynamicThreads = 1;
-    core->hAudioThread = NULL;
-    core->hAudioStartEvent = NULL;
     core->videoQueueSize = 4096;
+
+    core->videoEncoder = 0;
+    core->mjpegQuality = 85;
+
+    InitializeCriticalSection(&g_muxer_lock);
+
+    g_tjc = tjInitCompress();
+    g_mjpeg_pkt = av_packet_alloc();
+
     QueryPerformanceFrequency(&core->recFreq);
     InterlockedExchange(&core->recording, 0);
     InterlockedExchange(&core->paused, 0);
     InterlockedExchange(&core->converting, 0);
+
+    core->browserCount = GetInstalledBrowsers(core->browserNames, MAX_BROWSERS);
+
+    core->ffmpegCoreMask = GetSecondLastCoreAffinityMask();
+    SetAllProcessesAffinityExcludingFFmpegCore(core);
+
+    core->processMonitorRunning = 1;
+    core->hProcessMonitorThread = (HANDLE)_beginthreadex(NULL, 0, ProcessMonitorThread, core, 0, NULL);
+
+    DWORD_PTR uiAffinityMask = ~core->ffmpegCoreMask;
+    SetProcessAffinityMask(GetCurrentProcess(), uiAffinityMask);
+}
+
+static BOOL WINAPI PhantomCtrlHandler(DWORD type) {
+    // PhantomRec attaches to maxenc/maxsound's console to send 'q'. If the
+    // 'q' path times out, it sends CTRL_BREAK — which, with process group 0,
+    // is delivered to every process on that console, including PhantomRec.
+    // Without this handler the default action is ExitProcess. Swallow it.
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
+        type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT ||
+        type == CTRL_SHUTDOWN_EVENT) {
+        return TRUE;
+    }
+    return FALSE;
 }
 
 void Core_DetectResolution(PhantomRecCore* core) {
@@ -434,9 +737,9 @@ void Core_ConfigurePipeline(PhantomRecCore* core) {
 
     int winVer = GetWindowsVersion();
     if (winVer == 7) {
-        core->crf = 26; core->maxrate = 3000; core->bufsize = 6000; core->pipeBufferSizeMB = 2;
+        core->crf = 23; core->maxrate = 3000; core->bufsize = 6000; core->pipeBufferSizeMB = 2;
     } else if (winVer == 8) {
-        core->crf = 26; core->maxrate = 4000; core->bufsize = 8000; core->pipeBufferSizeMB = 4;
+        core->crf = 23; core->maxrate = 4000; core->bufsize = 8000; core->pipeBufferSizeMB = 4;
     } else if (cores <= 2) {
         core->crf = 23; core->maxrate = 4000; core->bufsize = 8000; core->pipeBufferSizeMB = 4;
     } else if (cores <= 4) {
@@ -453,32 +756,6 @@ void Core_SetCaptureMethod(PhantomRecCore* core) {
     GetCaptureInput(core, captureInput, sizeof(captureInput));
 }
 
-void Core_WarmEngine(PhantomRecCore* core) {
-    char captureInput[512];
-    GetCaptureInput(core, captureInput, sizeof(captureInput));
-    char warmupCmd[1024];
-    if (core->captureMethod <= 1) {
-        sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "\"%s\" -y -hide_banner -loglevel error %s -vf \"hwdownload,format=bgra,format=yuv420p\" -frames:v 3 -c:v ffvhuff -pred left -threads 1 -pix_fmt yuv420p -f null NUL",
-            core->maxsenginePath, captureInput);
-    } else {
-        sprintf_s(warmupCmd, sizeof(warmupCmd),
-            "\"%s\" -y -hide_banner -loglevel error -f gdigrab -framerate 60 -i desktop -vf \"format=yuv420p\" -frames:v 3 -c:v ffvhuff -pred left -threads 1 -pix_fmt yuv420p -f null NUL",
-            core->maxsenginePath);
-    }
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {0};
-    if (CreateProcessA(NULL, warmupCmd, NULL, NULL, FALSE,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
-        NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 3000);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
-}
-
 void Core_CleanupOrphanedTempFiles(PhantomRecCore* core) {
     char searchPath[MAX_PATH];
     sprintf_s(searchPath, MAX_PATH, "%s\\*_temp.mkv", core->outputDir);
@@ -492,25 +769,258 @@ void Core_CleanupOrphanedTempFiles(PhantomRecCore* core) {
         } while (FindNextFileA(hFind, &findData));
         FindClose(hFind);
     }
+    sprintf_s(searchPath, MAX_PATH, "%s\\*_temp.wav", core->outputDir);
+    hFind = FindFirstFileA(searchPath, &findData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            char fullPath[MAX_PATH];
+            sprintf_s(fullPath, MAX_PATH, "%s\\%s", core->outputDir, findData.cFileName);
+            DeleteFileA(fullPath);
+        } while (FindNextFileA(hFind, &findData));
+        FindClose(hFind);
+    }
+    // Clean up leftover .t0 marker files too
+    sprintf_s(searchPath, MAX_PATH, "%s\\*.t0", core->outputDir);
+    hFind = FindFirstFileA(searchPath, &findData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            char fullPath[MAX_PATH];
+            sprintf_s(fullPath, MAX_PATH, "%s\\%s", core->outputDir, findData.cFileName);
+            DeleteFileA(fullPath);
+        } while (FindNextFileA(hFind, &findData));
+        FindClose(hFind);
+    }
 }
 
 // ============================================================================
-// Core Shutdown - now does nothing (power plan management removed)
+// Core shutdown
 // ============================================================================
-
 void Core_Shutdown(PhantomRecCore* core) {
-    // Power plan management has been removed.
-    // This function is kept as a stub to avoid breaking any existing calls.
-    (void)core;
+    core->processMonitorRunning = 0;
+    if (core->hProcessMonitorThread) {
+        WaitForSingleObject(core->hProcessMonitorThread, 1000);
+        CloseHandle(core->hProcessMonitorThread);
+        core->hProcessMonitorThread = NULL;
+    }
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    DWORD_PTR allCoresMask = 0;
+    for (DWORD i = 0; i < si.dwNumberOfProcessors; i++) allCoresMask |= (DWORD_PTR)1 << i;
+    SetProcessAffinityMask(GetCurrentProcess(), allCoresMask);
+
+    RestoreAllProcessAffinities(core);
+    if (g_fmt_ctx) {
+        if (g_fmt_ctx->pb) avio_close(g_fmt_ctx->pb);
+        avformat_free_context(g_fmt_ctx);
+        g_fmt_ctx = NULL;
+    }
+    g_video_stream = NULL;
+    DeleteCriticalSection(&g_muxer_lock);
+
+    if (g_tjc) { tjDestroy(g_tjc); g_tjc = NULL; }
+    if (g_mjpeg_pkt) { av_packet_free(&g_mjpeg_pkt); g_mjpeg_pkt = NULL; }
+}
+
+static void RestoreAllProcessAffinities(PhantomRecCore* core) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    DWORD_PTR allCoresMask = 0;
+    for (DWORD i = 0; i < si.dwNumberOfProcessors; i++) allCoresMask |= (DWORD_PTR)1 << i;
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == 0 || pe32.th32ProcessID == GetCurrentProcessId()) continue;
+            if (IsGameProcess(core, pe32.th32ProcessID)) {
+                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
+                if (hProcess) {
+                    SetProcessAffinityMask(hProcess, allCoresMask);
+                    CloseHandle(hProcess);
+                }
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    CloseHandle(hSnapshot);
 }
 
 // ============================================================================
-// Start / Stop Recording
+// In-process MJPEG capture thread (videoEncoder == 2 only)
 // ============================================================================
+static unsigned int __stdcall CaptureThreadMJPEG(void* param) {
+    PhantomRecCore* core = (PhantomRecCore*)param;
+    int targetFPS = (core->cpuCoreCount >= 4) ? 60 : 30;
 
+    AVFormatContext* input_ctx = NULL;
+    AVCodecContext*  bmp_dec   = NULL;
+    AVFrame*         bmp_frame = NULL;
+    AVPacket*        in_pkt    = NULL;
+
+    AVFilterGraph*   graph     = NULL;
+    AVFilterContext* sink_ctx  = NULL;
+    AVFrame*         frame     = NULL;
+
+    int w = 0, h = 0;
+
+    if (core->captureMethod == 2) {
+        avdevice_register_all();
+        const AVInputFormat* ifmt = av_find_input_format("gdigrab");
+        if (!ifmt) return 1;
+        AVDictionary* opts = NULL;
+        char fpsStr[8];
+        snprintf(fpsStr, sizeof(fpsStr), "%d", targetFPS);
+        av_dict_set(&opts, "framerate", fpsStr, 0);
+        av_dict_set(&opts, "draw_mouse", "1", 0);
+        if (avformat_open_input(&input_ctx, "desktop", ifmt, &opts) < 0) {
+            av_dict_free(&opts);
+            return 1;
+        }
+        av_dict_free(&opts);
+        if (avformat_find_stream_info(input_ctx, NULL) < 0) goto done;
+
+        int v_idx = -1;
+        for (unsigned i = 0; i < input_ctx->nb_streams; i++) {
+            if (input_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                v_idx = i; break;
+            }
+        }
+        if (v_idx < 0) goto done;
+        AVCodecParameters* par = input_ctx->streams[v_idx]->codecpar;
+        w = par->width; h = par->height;
+        const AVCodec* dec_codec = avcodec_find_decoder(par->codec_id);
+        if (!dec_codec) goto done;
+        bmp_dec = avcodec_alloc_context3(dec_codec);
+        if (!bmp_dec) goto done;
+        avcodec_parameters_to_context(bmp_dec, par);
+        if (avcodec_open2(bmp_dec, dec_codec, NULL) < 0) goto done;
+        bmp_frame = av_frame_alloc();
+        in_pkt    = av_packet_alloc();
+        if (!bmp_frame || !in_pkt) goto done;
+    } else {
+        const AVFilter* src  = NULL;
+        const AVFilter* hwdl = avfilter_get_by_name("hwdownload");
+        const AVFilter* fmt  = avfilter_get_by_name("format");
+        const AVFilter* sink = avfilter_get_by_name("buffersink");
+        if (!hwdl || !fmt || !sink) return 1;
+
+        graph = avfilter_graph_alloc();
+        if (!graph) return 1;
+
+        char src_args[256];
+        if (core->captureMethod == 0) {
+            src = avfilter_get_by_name("gfxcapture");
+            snprintf(src_args, sizeof(src_args),
+                     "monitor_idx=0:capture_cursor=1:max_framerate=%d", targetFPS);
+        } else {
+            src = avfilter_get_by_name("ddagrab");
+            snprintf(src_args, sizeof(src_args),
+                     "output_idx=0:draw_mouse=1:framerate=%d", targetFPS);
+        }
+        if (!src) { avfilter_graph_free(&graph); return 1; }
+
+        AVFilterContext *src_ctx = NULL, *hwdl_ctx = NULL, *fmt_ctx = NULL;
+        if (avfilter_graph_create_filter(&src_ctx, src, "src", src_args, NULL, graph) < 0) goto done_graph;
+        if (avfilter_graph_create_filter(&hwdl_ctx, hwdl, "hwdl", NULL, NULL, graph) < 0) goto done_graph;
+        if (avfilter_graph_create_filter(&fmt_ctx, fmt, "fmt", "pix_fmts=bgra", NULL, graph) < 0) goto done_graph;
+        if (avfilter_graph_create_filter(&sink_ctx, sink, "sink", NULL, NULL, graph) < 0) goto done_graph;
+        if (avfilter_link(src_ctx,  0, hwdl_ctx, 0) < 0) goto done_graph;
+        if (avfilter_link(hwdl_ctx, 0, fmt_ctx,  0) < 0) goto done_graph;
+        if (avfilter_link(fmt_ctx,  0, sink_ctx, 0) < 0) goto done_graph;
+        if (avfilter_graph_config(graph, NULL) < 0) goto done_graph;
+
+        frame = av_frame_alloc();
+        if (!frame) goto done_graph;
+        if (av_buffersink_get_frame(sink_ctx, frame) < 0) goto done_graph;
+        w = frame->width; h = frame->height;
+        av_frame_unref(frame);
+    }
+
+    while (g_captureRunning && InterlockedCompareExchange(&core->recording, 1, 1) == 1) {
+        if (InterlockedCompareExchange(&core->paused, 1, 1) == 1) {
+            Sleep(10);
+            continue;
+        }
+        if (core->captureMethod == 2) {
+            int rr = av_read_frame(input_ctx, in_pkt);
+            if (rr == AVERROR(EAGAIN)) { Sleep(1); continue; }
+            if (rr < 0) break;
+            if (avcodec_send_packet(bmp_dec, in_pkt) == 0) {
+                if (avcodec_receive_frame(bmp_dec, bmp_frame) == 0) {
+                    MuxJPEGFrame(core, bmp_frame->data[0], bmp_frame->width,
+                                 bmp_frame->height, bmp_frame->linesize[0]);
+                    av_frame_unref(bmp_frame);
+                }
+            }
+            av_packet_unref(in_pkt);
+        } else {
+            int rr = av_buffersink_get_frame(sink_ctx, frame);
+            if (rr == AVERROR(EAGAIN)) { Sleep(1); continue; }
+            if (rr < 0) break;
+            MuxJPEGFrame(core, frame->data[0], frame->width, frame->height, frame->linesize[0]);
+            av_frame_unref(frame);
+        }
+    }
+
+done_graph:
+    if (frame)     av_frame_free(&frame);
+    if (graph)     avfilter_graph_free(&graph);
+
+done:
+    if (in_pkt)    av_packet_free(&in_pkt);
+    if (bmp_frame) av_frame_free(&bmp_frame);
+    if (bmp_dec)   avcodec_free_context(&bmp_dec);
+    if (input_ctx) avformat_close_input(&input_ctx);
+    return 0;
+}
+
+// ============================================================================
+// External child idle thread
+// ============================================================================
+static unsigned int __stdcall CaptureThreadExternal(void* param) {
+    PhantomRecCore* core = (PhantomRecCore*)param;
+    while (g_captureRunning && InterlockedCompareExchange(&core->recording, 1, 1) == 1) {
+        Sleep(50);
+    }
+    return 0;
+}
+
+// ============================================================================
+// Probe for maxsound
+// ============================================================================
+void Core_ProbeAudio(PhantomRecCore* core) {
+    core->audioActive = 0;
+    if (core->maxsoundPath[0] == '\0') return;
+    if (!Core_FileExists(core->maxsoundPath)) return;
+
+    char probeCmd[1024];
+    snprintf(probeCmd, sizeof(probeCmd), "\"%s\" --probe-only", core->maxsoundPath);
+
+    STARTUPINFOA siP = { sizeof(siP) };
+    siP.dwFlags = STARTF_USESHOWWINDOW;
+    siP.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION piP = {0};
+
+    if (CreateProcessA(NULL, probeCmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &siP, &piP)) {
+        WaitForSingleObject(piP.hProcess, 3000);
+        DWORD ec = 1;
+        GetExitCodeProcess(piP.hProcess, &ec);
+        core->audioActive = (ec == 0) ? 1 : 0;
+        CloseHandle(piP.hProcess);
+        CloseHandle(piP.hThread);
+    }
+}
+
+// ============================================================================
+// Start
+// ============================================================================
 int Core_StartRecording(PhantomRecCore* core) {
     if (InterlockedCompareExchange(&core->recording, 1, 1) == 1) return 0;
     if (InterlockedCompareExchange(&core->converting, 1, 1) == 1) return 0;
+
+    Core_DetectResolution(core);
 
     char ts[64];
     Core_Timestamp(ts, sizeof(ts));
@@ -518,100 +1028,118 @@ int Core_StartRecording(PhantomRecCore* core) {
     core->pauseSegmentCount = 0;
     core->segmentCount = 1;
     core->totalPausedDurationMs = 0;
+    memset(core->segmentAudioDelayMs, 0, sizeof(core->segmentAudioDelayMs));
+    memset(core->segmentVideoT0, 0, sizeof(core->segmentVideoT0));
+    memset(core->segmentAudioT0, 0, sizeof(core->segmentAudioT0));
     InterlockedExchange(&core->paused, 0);
 
-    sprintf_s(core->tempFile, MAX_PATH, "%s\\%s_seg0_temp.mkv", core->outputDir, ts);
+    sprintf_s(core->tempFile, MAX_PATH, "%s\\%s.mkv", core->outputDir, ts);
+    sprintf_s(core->tempAudioFile, MAX_PATH, "%s\\%s_seg0_temp.wav", core->outputDir, ts);
     sprintf_s(core->finalFile, MAX_PATH, "%s\\%s.mkv", core->outputDir, ts);
     strncpy_s(core->segmentFiles[0], MAX_PATH, core->tempFile, _TRUNCATE);
 
-    int wasapiReady = InitializeWASAPI(core);
-    if (wasapiReady) {
-        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-        CreatePipe(&core->hAudioPipeRead, &core->hAudioPipeWrite, &sa, core->pipeBufferSizeMB * 1024 * 1024);
-        SetHandleInformation(core->hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
-    }
-
-    strncpy_s(core->audioFormat, sizeof(core->audioFormat), "s16le", _TRUNCATE);
-    core->audioSampleRate = 48000;
-    core->audioChannels = 2;
-    if (wasapiReady && core->waveFormat) {
-        strncpy_s(core->audioFormat, sizeof(core->audioFormat),
-            (core->audioBitsPerSample == 32) ? "f32le" : "s16le", _TRUNCATE);
-        core->audioSampleRate = core->waveFormat->nSamplesPerSec;
-        core->audioChannels = core->waveFormat->nChannels;
-    }
+    int wasapiReady = core->audioActive ? 1 : 0;
 
     InterlockedExchange(&core->recording, 1);
-    char cmdLine[8196];
-    BuildCaptureCommand(core, core->tempFile, wasapiReady, cmdLine, sizeof(cmdLine));
+
+    int useMaxEncChild = (core->maxencPath[0] != '\0' && Core_FileExists(core->maxencPath));
+    int useMaxSound    = (core->maxsoundPath[0] != '\0' && Core_FileExists(core->maxsoundPath));
+    if (!useMaxSound) wasapiReady = 0;
+
+    if (!useMaxEncChild) {
+        if (core->onStatusUpdate) core->onStatusUpdate("maxenc.exe missing - using in-process MJPEG");
+        core->videoEncoder = 2;
+    } else {
+        core->videoEncoder = 0;
+    }
+
+    if (useMaxEncChild) {
+        char videoCmd[8196];
+        BuildMaxEncCommand(core, core->tempFile, videoCmd, sizeof(videoCmd));
+        if (!SpawnVideoChild(videoCmd, &core->ffmpegProcess)) {
+            if (core->onStatusUpdate) core->onStatusUpdate("maxenc.exe spawn failed - using in-process MJPEG");
+            core->videoEncoder = 2;
+            useMaxEncChild = 0;
+        } else {
+            QueryPerformanceCounter(&core->segmentStartTime);
+            QueryPerformanceCounter(&core->recStart);
+            core->sessions++;
+            g_captureRunning = 1;
+            g_hCaptureThread = (HANDLE)_beginthreadex(NULL, 0, CaptureThreadExternal, core, 0, NULL);
+            if (!g_hCaptureThread) { g_captureRunning = 0; goto fail; }
+        }
+    }
+
+    if (!useMaxEncChild) {
+        if (avformat_alloc_output_context2(&g_fmt_ctx, NULL, "matroska", core->segmentFiles[0]) < 0) {
+            if (core->onStatusUpdate) core->onStatusUpdate("MJPEG: alloc output failed");
+            goto fail;
+        }
+        av_opt_set_int(g_fmt_ctx, "max_muxing_queue_size", 8192, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(g_fmt_ctx, "max_interleave_delta", 1000000, AV_OPT_SEARCH_CHILDREN);
+        if (avio_open(&g_fmt_ctx->pb, core->segmentFiles[0], AVIO_FLAG_WRITE) < 0) {
+            if (core->onStatusUpdate) core->onStatusUpdate("MJPEG: avio_open failed");
+            goto fail;
+        }
+        g_video_stream = avformat_new_stream(g_fmt_ctx, NULL);
+        if (!g_video_stream) goto fail;
+        g_video_stream->codecpar->codec_id   = AV_CODEC_ID_MJPEG;
+        g_video_stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        g_video_stream->codecpar->width      = core->screenWidth;
+        g_video_stream->codecpar->height     = core->screenHeight;
+        g_video_stream->codecpar->format     = AV_PIX_FMT_YUV420P;
+        g_video_stream->time_base            = (AVRational){1, 1000000};
+        g_video_stream->avg_frame_rate       = (AVRational){60, 1};
+        if (avformat_write_header(g_fmt_ctx, NULL) < 0) {
+            if (core->onStatusUpdate) core->onStatusUpdate("MJPEG: write_header failed");
+            goto fail;
+        }
+        QueryPerformanceCounter(&core->segmentStartTime);
+        QueryPerformanceCounter(&core->recStart);
+        core->sessions++;
+        g_captureRunning = 1;
+        g_hCaptureThread = (HANDLE)_beginthreadex(NULL, 0, CaptureThreadMJPEG, core, 0, NULL);
+        if (!g_hCaptureThread) { g_captureRunning = 0; goto fail; }
+    }
 
     if (wasapiReady) {
-        if (core->hAudioStartEvent) CloseHandle(core->hAudioStartEvent);
-        core->hAudioStartEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
-        core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
-    }
+        int64_t videoT0 = WaitT0Marker(core->tempFile, 500);
+        core->segmentVideoT0[0] = videoT0;
 
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    if (wasapiReady && core->hAudioPipeRead) {
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdInput = core->hAudioPipeRead;
-        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-    }
-    si.wShowWindow = SW_HIDE;  // hide the console window
+        char audioMarkerPath[MAX_PATH];
+        snprintf(audioMarkerPath, sizeof(audioMarkerPath), "%s.t0", core->tempAudioFile);
 
-    // Launch FFmpeg directly (no cmd.exe)
-    if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
-        NULL, NULL, &si, &core->ffmpegProcess)) {
-        DWORD err = GetLastError();
-        if (core->onStatusUpdate) {
-            char msg[128];
-            sprintf_s(msg, sizeof(msg), "CreateProcess failed with error %lu", err);
-            core->onStatusUpdate(msg);
+        if (!SpawnMaxSound(core, core->tempAudioFile, audioMarkerPath,
+                           &core->ffmpegAudioProcess)) {
+            if (core->onStatusUpdate) core->onStatusUpdate("maxsound spawn failed - video only");
         }
-        InterlockedExchange(&core->recording, 0);
-        if (core->hAudioStartEvent) {
-            SetEvent(core->hAudioStartEvent);
-            CloseHandle(core->hAudioStartEvent);
-            core->hAudioStartEvent = NULL;
-        }
-        if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
-        if (core->hAudioThread) {
-            WaitForSingleObject(core->hAudioThread, 5000);
-            CloseHandle(core->hAudioThread);
-            core->hAudioThread = NULL;
-        }
-        if (core->hAudioPipeWrite) { CloseHandle(core->hAudioPipeWrite); core->hAudioPipeWrite = NULL; }
-        CleanupWASAPI(core);
-        return 0;
     }
-
-    if (core->hAudioStartEvent) {
-        SetEvent(core->hAudioStartEvent);
-        CloseHandle(core->hAudioStartEvent);
-        core->hAudioStartEvent = NULL;
-    }
-    if (core->hAudioPipeRead) {
-        CloseHandle(core->hAudioPipeRead);
-        core->hAudioPipeRead = NULL;
-    }
-
-    SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
-    QueryPerformanceCounter(&core->recStart);
-    core->sessions++;
 
     if (core->onStatusUpdate) core->onStatusUpdate("Recording...");
     if (core->onButtonUpdate) core->onButtonUpdate("STOP");
     return 1;
+
+fail:
+    InterlockedExchange(&core->recording, 0);
+    if (g_fmt_ctx) {
+        if (g_fmt_ctx->pb) avio_close(g_fmt_ctx->pb);
+        avformat_free_context(g_fmt_ctx);
+        g_fmt_ctx = NULL;
+    }
+    g_video_stream = NULL;
+    return 0;
 }
 
+// ============================================================================
+// Stop
+// ============================================================================
 void Core_StopRecording(PhantomRecCore* core) {
     if (InterlockedCompareExchange(&core->recording, 1, 1) == 0) return;
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
+    core->segmentDurationMs = (now.QuadPart - core->segmentStartTime.QuadPart) * 1000 / core->recFreq.QuadPart;
+
     long long totalElapsedMs = (now.QuadPart - core->recStart.QuadPart) * 1000 / core->recFreq.QuadPart;
     long long actualDurationMs = totalElapsedMs - core->totalPausedDurationMs;
     if (actualDurationMs < 1000) actualDurationMs = 1000;
@@ -620,93 +1148,218 @@ void Core_StopRecording(PhantomRecCore* core) {
     InterlockedExchange(&core->recording, 0);
     InterlockedExchange(&core->paused, 0);
 
-    // Close pipe write BEFORE waiting for audio thread
-    if (core->hAudioPipeWrite) {
-        CloseHandle(core->hAudioPipeWrite);
-        core->hAudioPipeWrite = NULL;
-    }
-    if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
-    if (core->hAudioThread) {
-        WaitForSingleObject(core->hAudioThread, 5000);
-        CloseHandle(core->hAudioThread);
-        core->hAudioThread = NULL;
-    }
-    CleanupWASAPI(core);
-
-    // Save PID before stopping FFmpeg (will be zeroed)
-    DWORD pid = core->ffmpegProcess.dwProcessId;
-    StopFFmpegProcess(core, 2000);
-
-    if (pid) {
-        CloseConsoleWindow(pid);
-    }
-
-    SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-    Sleep(1500);
-
-    // ----- Segment list and concatenation -----
-    char segmentsTxt[MAX_PATH];
-    sprintf_s(segmentsTxt, MAX_PATH, "%s\\segments.txt", core->outputDir);
-    FILE* segFile = NULL;
-    fopen_s(&segFile, segmentsTxt, "w");
-    int validSegments = 0;
-    for (int i = 0; i < core->segmentCount; i++) {
-        if (Core_FileExists(core->segmentFiles[i]) && Core_GetFileSize(core->segmentFiles[i]) > 2048) {
-            fprintf(segFile, "file '%s'\r\n", core->segmentFiles[i]);
-            validSegments++;
+    if (core->videoEncoder == 2) {
+        g_captureRunning = 0;
+        if (g_hCaptureThread) {
+            WaitForSingleObject(g_hCaptureThread, 500);
+            CloseHandle(g_hCaptureThread);
+            g_hCaptureThread = NULL;
         }
+        EnterCriticalSection(&g_muxer_lock);
+        if (g_fmt_ctx) {
+            av_write_trailer(g_fmt_ctx);
+            avio_close(g_fmt_ctx->pb);
+            avformat_free_context(g_fmt_ctx);
+            g_fmt_ctx = NULL;
+        }
+        g_video_stream = NULL;
+        LeaveCriticalSection(&g_muxer_lock);
+    } else {
+        g_captureRunning = 0;
+        if (g_hCaptureThread) {
+            WaitForSingleObject(g_hCaptureThread, 500);
+            CloseHandle(g_hCaptureThread);
+            g_hCaptureThread = NULL;
+        }
+        StopVideoChild(&core->ffmpegProcess, 1500);
     }
-    if (segFile) fclose(segFile);
 
-    if (validSegments == 0) {
-        DeleteFileA(segmentsTxt);
-        if (core->onStatusUpdate) core->onStatusUpdate("No recording data found");
-        return;
-    }
+    StopMaxSound(&core->ffmpegAudioProcess, 1500);
 
-    // Always concatenate segments into a single lossless file
     char losslessFile[MAX_PATH];
     sprintf_s(losslessFile, MAX_PATH, "%s\\%s_lossless.mkv", core->outputDir, core->segmentBaseName);
 
-    char concatCmd[8196];
-    sprintf_s(concatCmd, sizeof(concatCmd),
-        "cmd.exe /c \"\"%s\" -y -loglevel error -f concat -safe 0 -i \"%s\" -c copy \"%s\"\"",
-        core->maxsenginePath, segmentsTxt, losslessFile);
+    if (core->segmentCount == 1) {
+        if (Core_FileExists(core->tempAudioFile) && Core_GetFileSize(core->tempAudioFile) > 2048) {
+            int64_t vT0 = core->segmentVideoT0[0];
+            if (vT0 == 0) vT0 = ReadT0Marker(core->segmentFiles[0]);
+            int64_t aT0 = ReadT0Marker(core->tempAudioFile);
+            int aDelayMs = 0;
+            if (vT0 != 0 && aT0 != 0) {
+                aDelayMs = QpcDeltaToMs(core, aT0, vT0);
+            }
 
-    STARTUPINFOA siConcat = { sizeof(siConcat) };
-    siConcat.dwFlags = STARTF_USESHOWWINDOW;
-    siConcat.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION piConcat = {0};
-    if (CreateProcessA(NULL, concatCmd, NULL, NULL, FALSE,
-        CREATE_NO_WINDOW, NULL, NULL, &siConcat, &piConcat)) {
-        WaitForSingleObject(piConcat.hProcess, INFINITE);
-        CloseHandle(piConcat.hProcess);
-        CloseHandle(piConcat.hThread);
-        DeleteFileA(segmentsTxt);
-        for (int i = 0; i < core->segmentCount; i++) {
-            if (Core_FileExists(core->segmentFiles[i])) DeleteFileA(core->segmentFiles[i]);
+            char muxCmd[8196];
+            if (aDelayMs >= 0) {
+                int useD = aDelayMs > 0 ? aDelayMs : 1;
+                sprintf_s(muxCmd, sizeof(muxCmd),
+                    "\"%s\" -y -loglevel error -i \"%s\" -i \"%s\" "
+                    "-c:v copy -c:a pcm_s16le -af adelay=%d:all=1 \"%s\"",
+                    core->maxsenginePath, core->segmentFiles[0], core->tempAudioFile,
+                    useD, losslessFile);
+            } else {
+                double trimS = (-aDelayMs) / 1000.0;
+                sprintf_s(muxCmd, sizeof(muxCmd),
+                    "\"%s\" -y -loglevel error -i \"%s\" -i \"%s\" "
+                    "-c:v copy -c:a pcm_s16le "
+                    "-af atrim=start=%.3f,asetpts=PTS-STARTPTS \"%s\"",
+                    core->maxsenginePath, core->segmentFiles[0], core->tempAudioFile,
+                    trimS, losslessFile);
+            }
+
+            STARTUPINFOA siMux = { sizeof(siMux) };
+            siMux.dwFlags = STARTF_USESHOWWINDOW;
+            siMux.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION piMux = {0};
+
+            if (CreateProcessA(NULL, muxCmd, NULL, NULL, FALSE,
+                CREATE_NO_WINDOW, NULL, NULL, &siMux, &piMux)) {
+                WaitForSingleObject(piMux.hProcess, INFINITE);
+                CloseHandle(piMux.hProcess);
+                CloseHandle(piMux.hThread);
+                // Delete the .t0 markers now that the mux is done with them.
+                char vM[MAX_PATH], aM[MAX_PATH];
+                snprintf(vM, sizeof(vM), "%s.t0", core->segmentFiles[0]);
+                snprintf(aM, sizeof(aM), "%s.t0", core->tempAudioFile);
+                DeleteFileWithRetry(vM);
+                DeleteFileWithRetry(aM);
+                DeleteFileWithRetry(core->segmentFiles[0]);
+                DeleteFileWithRetry(core->tempAudioFile);
+            } else {
+                CopyFileA(core->segmentFiles[0], losslessFile, FALSE);
+            }
+        } else {
+            CopyFileA(core->segmentFiles[0], losslessFile, FALSE);
+            DeleteFileWithRetry(core->segmentFiles[0]);
         }
     } else {
-        DeleteFileA(segmentsTxt);
-        if (core->onStatusUpdate) core->onStatusUpdate("Concatenation failed");
-        return;
+        char segmentsTxt[MAX_PATH];
+        sprintf_s(segmentsTxt, MAX_PATH, "%s\\segments_%s.txt", core->outputDir, core->segmentBaseName);
+        FILE* segFile = NULL;
+        fopen_s(&segFile, segmentsTxt, "w");
+        int validSegments = 0;
+
+        for (int i = 0; i < core->segmentCount; i++) {
+            char segmentAudioFile[MAX_PATH];
+            sprintf_s(segmentAudioFile, MAX_PATH, "%s\\%s_seg%d_temp.wav",
+                core->outputDir, core->segmentBaseName, i);
+            char mergedSegmentFile[MAX_PATH];
+            sprintf_s(mergedSegmentFile, MAX_PATH, "%s\\%s_seg%d_merged.mkv",
+                core->outputDir, core->segmentBaseName, i);
+
+            if (Core_FileExists(core->segmentFiles[i]) && Core_GetFileSize(core->segmentFiles[i]) > 2048) {
+                if (Core_FileExists(segmentAudioFile) && Core_GetFileSize(segmentAudioFile) > 2048) {
+                    int64_t vT0 = core->segmentVideoT0[i];
+                    if (vT0 == 0) vT0 = ReadT0Marker(core->segmentFiles[i]);
+                    int64_t aT0 = ReadT0Marker(segmentAudioFile);
+                    int aDelayMs = 0;
+                    if (vT0 != 0 && aT0 != 0) {
+                        aDelayMs = QpcDeltaToMs(core, aT0, vT0);
+                    }
+
+                    char muxCmd[8196];
+                    if (aDelayMs >= 0) {
+                        int useD = aDelayMs > 0 ? aDelayMs : 1;
+                        sprintf_s(muxCmd, sizeof(muxCmd),
+                            "\"%s\" -y -loglevel error -i \"%s\" -i \"%s\" "
+                            "-c:v copy -c:a pcm_s16le -af adelay=%d:all=1 \"%s\"",
+                            core->maxsenginePath, core->segmentFiles[i], segmentAudioFile,
+                            useD, mergedSegmentFile);
+                    } else {
+                        double trimS = (-aDelayMs) / 1000.0;
+                        sprintf_s(muxCmd, sizeof(muxCmd),
+                            "\"%s\" -y -loglevel error -i \"%s\" -i \"%s\" "
+                            "-c:v copy -c:a pcm_s16le "
+                            "-af atrim=start=%.3f,asetpts=PTS-STARTPTS \"%s\"",
+                            core->maxsenginePath, core->segmentFiles[i], segmentAudioFile,
+                            trimS, mergedSegmentFile);
+                    }
+
+                    STARTUPINFOA siMux = { sizeof(siMux) };
+                    siMux.dwFlags = STARTF_USESHOWWINDOW;
+                    siMux.wShowWindow = SW_HIDE;
+                    PROCESS_INFORMATION piMux = {0};
+
+                    if (CreateProcessA(NULL, muxCmd, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &siMux, &piMux)) {
+                        WaitForSingleObject(piMux.hProcess, INFINITE);
+                        CloseHandle(piMux.hProcess);
+                        CloseHandle(piMux.hThread);
+                        // Delete the .t0 markers now that the mux is done with them.
+                        char vM[MAX_PATH], aM[MAX_PATH];
+                        snprintf(vM, sizeof(vM), "%s.t0", core->segmentFiles[i]);
+                        snprintf(aM, sizeof(aM), "%s.t0", segmentAudioFile);
+                        DeleteFileWithRetry(vM);
+                        DeleteFileWithRetry(aM);
+                        if (segFile) fprintf(segFile, "file '%s'\r\n", mergedSegmentFile);
+                        validSegments++;
+                        DeleteFileWithRetry(core->segmentFiles[i]);
+                        DeleteFileWithRetry(segmentAudioFile);
+                    }
+                } else {
+                    CopyFileA(core->segmentFiles[i], mergedSegmentFile, FALSE);
+                    if (segFile) fprintf(segFile, "file '%s'\r\n", mergedSegmentFile);
+                    validSegments++;
+                    DeleteFileWithRetry(core->segmentFiles[i]);
+                }
+            }
+        }
+        if (segFile) fclose(segFile);
+
+        if (validSegments > 1) {
+            char concatCmd[8196];
+            sprintf_s(concatCmd, sizeof(concatCmd),
+                "\"%s\" -y -loglevel error -f concat -safe 0 -i \"%s\" -c copy \"%s\"",
+                core->maxsenginePath, segmentsTxt, losslessFile);
+            STARTUPINFOA siConcat = { sizeof(siConcat) };
+            siConcat.dwFlags = STARTF_USESHOWWINDOW;
+            siConcat.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION piConcat = {0};
+
+            if (CreateProcessA(NULL, concatCmd, NULL, NULL, FALSE,
+                CREATE_NO_WINDOW, NULL, NULL, &siConcat, &piConcat)) {
+                WaitForSingleObject(piConcat.hProcess, INFINITE);
+                CloseHandle(piConcat.hProcess);
+                CloseHandle(piConcat.hThread);
+                for (int i = 0; i < core->segmentCount; i++) {
+                    char mergedFile[MAX_PATH];
+                    sprintf_s(mergedFile, MAX_PATH, "%s\\%s_seg%d_merged.mkv",
+                        core->outputDir, core->segmentBaseName, i);
+                    DeleteFileWithRetry(mergedFile);
+                }
+                DeleteFileWithRetry(segmentsTxt);
+            }
+        } else if (validSegments == 1) {
+            for (int i = 0; i < core->segmentCount; i++) {
+                char mergedFile[MAX_PATH];
+                sprintf_s(mergedFile, MAX_PATH, "%s\\%s_seg%d_merged.mkv",
+                    core->outputDir, core->segmentBaseName, i);
+                if (Core_FileExists(mergedFile)) {
+                    CopyFileA(mergedFile, losslessFile, FALSE);
+                    DeleteFileWithRetry(mergedFile);
+                    break;
+                }
+            }
+            DeleteFileWithRetry(segmentsTxt);
+        }
     }
 
-    // Stage 2: compress to MP4
+    // Stage 2: x264 conversion
     if (core->convertAfterRecording && core->lastRecordingDurationMs >= 1000) {
         InterlockedExchange(&core->converting, 1);
         core->convertProgress = 0;
         if (core->onStatusUpdate) core->onStatusUpdate("Processing video...");
         if (core->onButtonUpdate) core->onButtonUpdate("Processing...");
 
+        int targetFPS = (core->cpuCoreCount >= 4) ? 60 : 55;
         char cmdLine[8196];
         sprintf_s(cmdLine, sizeof(cmdLine),
             "\"%s\" -y -progress pipe:1 -loglevel error -i \"%s\" "
-            "-c:v libx264 -preset veryfast -crf %d "
+            "-c:v libx264 -preset ultrafast -crf %d -color_range tv "
             "-c:a aac -b:a 96k -af aresample=async=1 "
-            "-pix_fmt yuv420p -r 60 -fps_mode cfr "
+            "-pix_fmt yuv420p -r %d -fps_mode cfr "
             "-movflags +faststart \"%s\"",
-            core->maxsenginePath, losslessFile, core->crf, core->finalFile);
+            core->maxsenginePath, losslessFile, core->crf, targetFPS, core->finalFile);
 
         HANDLE hRead, hWrite;
         SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
@@ -721,7 +1374,6 @@ void Core_StopRecording(PhantomRecCore* core) {
         siConv.wShowWindow = SW_HIDE;
 
         PROCESS_INFORMATION convertPI = {0};
-        SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
 
         if (CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
             CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
@@ -756,7 +1408,6 @@ void Core_StopRecording(PhantomRecCore* core) {
             WaitForSingleObject(convertPI.hProcess, INFINITE);
             CloseHandle(convertPI.hProcess);
             CloseHandle(convertPI.hThread);
-            SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
             DeleteFileA(losslessFile);
 
@@ -775,7 +1426,6 @@ void Core_StopRecording(PhantomRecCore* core) {
             CloseHandle(hWrite);
         }
     } else {
-        // keep lossless
         strncpy_s(core->finalFile, MAX_PATH, losslessFile, _TRUNCATE);
         long long fs = Core_GetFileSize(core->finalFile);
         if (fs > 2048) {
@@ -787,129 +1437,140 @@ void Core_StopRecording(PhantomRecCore* core) {
     }
 }
 
+// ============================================================================
+// Pause / resume
+// ============================================================================
 void Core_TogglePause(PhantomRecCore* core) {
     if (InterlockedCompareExchange(&core->recording, 1, 1) == 0) return;
     if (InterlockedCompareExchange(&core->converting, 1, 1) == 1) return;
 
     int currentPause = InterlockedCompareExchange(&core->paused, 1, 1);
+
     if (currentPause == 0) {
-        // Pause
+        // ---------- PAUSE ----------
         InterlockedExchange(&core->paused, 1);
         QueryPerformanceCounter(&core->pauseTime);
 
-        // close pipe write before stopping audio thread
-        if (core->hAudioPipeWrite) {
-            CloseHandle(core->hAudioPipeWrite);
-            core->hAudioPipeWrite = NULL;
+        if (core->videoEncoder == 2) {
+            g_captureRunning = 0;
+            if (g_hCaptureThread) {
+                WaitForSingleObject(g_hCaptureThread, 500);
+                CloseHandle(g_hCaptureThread);
+                g_hCaptureThread = NULL;
+            }
+            EnterCriticalSection(&g_muxer_lock);
+            if (g_fmt_ctx) {
+                av_write_trailer(g_fmt_ctx);
+                avio_close(g_fmt_ctx->pb);
+                avformat_free_context(g_fmt_ctx);
+                g_fmt_ctx = NULL;
+            }
+            g_video_stream = NULL;
+            LeaveCriticalSection(&g_muxer_lock);
+        } else {
+            g_captureRunning = 0;
+            if (g_hCaptureThread) {
+                WaitForSingleObject(g_hCaptureThread, 500);
+                CloseHandle(g_hCaptureThread);
+                g_hCaptureThread = NULL;
+            }
+            StopVideoChild(&core->ffmpegProcess, 1500);
         }
-        if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
-        if (core->hAudioThread) {
-            WaitForSingleObject(core->hAudioThread, 100);
-            CloseHandle(core->hAudioThread);
-            core->hAudioThread = NULL;
-        }
-        CleanupWASAPI(core);
 
-        // Save PID before stopping FFmpeg
-        DWORD pid = core->ffmpegProcess.dwProcessId;
-        StopFFmpegProcess(core, 500);
-        if (pid) {
-            CloseConsoleWindow(pid);
-        }
+        StopMaxSound(&core->ffmpegAudioProcess, 1500);
 
         if (core->onStatusUpdate) core->onStatusUpdate("PAUSED");
         if (core->onButtonUpdate) core->onButtonUpdate("RESUME");
-    } else {
-        // Resume
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        core->totalPausedDurationMs += (long long)((now.QuadPart - core->pauseTime.QuadPart) * 1000 / core->recFreq.QuadPart);
-
-        if (core->segmentCount >= 64) {
-            if (core->onStatusUpdate) core->onStatusUpdate("Too many segments – stop and restart");
-            return;
-        }
-
-        core->pauseSegmentCount++;
-        sprintf_s(core->segmentFiles[core->segmentCount], MAX_PATH,
-            "%s\\%s_seg%d_temp.mkv",
-            core->outputDir, core->segmentBaseName, core->pauseSegmentCount);
-        core->segmentCount++;
-
-        int wasapiReady = InitializeWASAPI(core);
-        if (wasapiReady) {
-            SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-            CreatePipe(&core->hAudioPipeRead, &core->hAudioPipeWrite, &sa, core->pipeBufferSizeMB * 1024 * 1024);
-            SetHandleInformation(core->hAudioPipeWrite, HANDLE_FLAG_INHERIT, 0);
-        }
-
-        if (wasapiReady) {
-            if (core->hAudioStartEvent) CloseHandle(core->hAudioStartEvent);
-            core->hAudioStartEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
-            core->hAudioThread = (HANDLE)_beginthreadex(NULL, 0, AudioToPipeThread, core, 0, NULL);
-        }
-
-        char cmdLine[8196];
-        BuildCaptureCommand(core, core->segmentFiles[core->segmentCount - 1], wasapiReady, cmdLine, sizeof(cmdLine));
-
-        STARTUPINFOA si = { sizeof(si) };
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        if (wasapiReady && core->hAudioPipeRead) {
-            si.dwFlags |= STARTF_USESTDHANDLES;
-            si.hStdInput = core->hAudioPipeRead;
-            si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-            si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-        }
-        si.wShowWindow = SW_HIDE;
-
-        if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | NORMAL_PRIORITY_CLASS,
-            NULL, NULL, &si, &core->ffmpegProcess)) {
-            InterlockedExchange(&core->recording, 0);
-            InterlockedExchange(&core->paused, 0);
-
-            if (core->hAudioStartEvent) {
-                SetEvent(core->hAudioStartEvent);
-                CloseHandle(core->hAudioStartEvent);
-                core->hAudioStartEvent = NULL;
-            }
-            if (core->hAudioReadyEvent) SetEvent(core->hAudioReadyEvent);
-            if (core->hAudioThread) {
-                WaitForSingleObject(core->hAudioThread, 100);
-                CloseHandle(core->hAudioThread);
-                core->hAudioThread = NULL;
-            }
-            if (core->hAudioPipeWrite) {
-                CloseHandle(core->hAudioPipeWrite);
-                core->hAudioPipeWrite = NULL;
-            }
-            CleanupWASAPI(core);
-
-            if (core->onStatusUpdate) core->onStatusUpdate("Resume failed – recording stopped");
-            if (core->onButtonUpdate) core->onButtonUpdate("START");
-            return;
-        }
-
-        if (core->hAudioStartEvent) {
-            SetEvent(core->hAudioStartEvent);
-            CloseHandle(core->hAudioStartEvent);
-            core->hAudioStartEvent = NULL;
-        }
-        if (core->hAudioPipeRead) {
-            CloseHandle(core->hAudioPipeRead);
-            core->hAudioPipeRead = NULL;
-        }
-
-        InterlockedExchange(&core->paused, 0);
-        if (core->onStatusUpdate) core->onStatusUpdate("Recording...");
-        if (core->onButtonUpdate) core->onButtonUpdate("STOP");
+        return;
     }
+
+    // ---------- RESUME ----------
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    core->totalPausedDurationMs += (long long)((now.QuadPart - core->pauseTime.QuadPart) * 1000 / core->recFreq.QuadPart);
+
+    if (core->segmentCount >= MAX_SEGMENTS) {
+        if (core->onStatusUpdate) core->onStatusUpdate("Too many segments - stop and restart");
+        return;
+    }
+
+    core->pauseSegmentCount++;
+    int newIdx = core->segmentCount;
+    sprintf_s(core->segmentFiles[newIdx], MAX_PATH,
+        "%s\\%s_seg%d_temp.mkv", core->outputDir, core->segmentBaseName, core->pauseSegmentCount);
+    sprintf_s(core->tempAudioFile, MAX_PATH,
+        "%s\\%s_seg%d_temp.wav", core->outputDir, core->segmentBaseName, core->pauseSegmentCount);
+    core->segmentCount++;
+
+    const char* newSeg = core->segmentFiles[newIdx];
+
+    if (core->videoEncoder == 0) {
+        char videoCmd[8196];
+        BuildMaxEncCommand(core, newSeg, videoCmd, sizeof(videoCmd));
+        if (!SpawnVideoChild(videoCmd, &core->ffmpegProcess)) goto resume_fail;
+    } else {
+        if (avformat_alloc_output_context2(&g_fmt_ctx, NULL, "matroska", newSeg) < 0) goto resume_fail;
+        av_opt_set_int(g_fmt_ctx, "max_muxing_queue_size", 8192, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(g_fmt_ctx, "max_interleave_delta", 1000000, AV_OPT_SEARCH_CHILDREN);
+        if (avio_open(&g_fmt_ctx->pb, newSeg, AVIO_FLAG_WRITE) < 0) goto resume_fail;
+        g_video_stream = avformat_new_stream(g_fmt_ctx, NULL);
+        if (!g_video_stream) goto resume_fail;
+        g_video_stream->codecpar->codec_id   = AV_CODEC_ID_MJPEG;
+        g_video_stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+        g_video_stream->codecpar->width      = core->screenWidth;
+        g_video_stream->codecpar->height     = core->screenHeight;
+        g_video_stream->codecpar->format     = AV_PIX_FMT_YUV420P;
+        g_video_stream->time_base            = (AVRational){1, 1000000};
+        g_video_stream->avg_frame_rate       = (AVRational){60, 1};
+        if (avformat_write_header(g_fmt_ctx, NULL) < 0) goto resume_fail;
+    }
+
+    // Wait for the new segment's video t0, then spawn maxsound.
+    int wasapiReady = core->audioActive ? 1 : 0;
+    if (wasapiReady) {
+        int64_t videoT0 = WaitT0Marker(newSeg, 500);
+        core->segmentVideoT0[newIdx] = videoT0;
+
+        char audioMarkerPath[MAX_PATH];
+        snprintf(audioMarkerPath, sizeof(audioMarkerPath), "%s.t0", core->tempAudioFile);
+
+        if (!SpawnMaxSound(core, core->tempAudioFile, audioMarkerPath,
+                           &core->ffmpegAudioProcess)) {
+            if (core->onStatusUpdate) core->onStatusUpdate("Resume: maxsound failed - video only");
+        }
+    }
+
+    QueryPerformanceCounter(&core->segmentStartTime);
+    g_captureRunning = 1;
+    if (core->videoEncoder == 2) {
+        g_hCaptureThread = (HANDLE)_beginthreadex(NULL, 0, CaptureThreadMJPEG, core, 0, NULL);
+    } else {
+        g_hCaptureThread = (HANDLE)_beginthreadex(NULL, 0, CaptureThreadExternal, core, 0, NULL);
+    }
+    if (!g_hCaptureThread) goto resume_fail;
+
+    InterlockedExchange(&core->paused, 0);
+    if (core->onStatusUpdate) core->onStatusUpdate("Recording...");
+    if (core->onButtonUpdate) core->onButtonUpdate("STOP");
+    return;
+
+resume_fail:
+    if (g_hCaptureThread) { g_captureRunning = 0; WaitForSingleObject(g_hCaptureThread, 500); CloseHandle(g_hCaptureThread); g_hCaptureThread = NULL; }
+    if (g_fmt_ctx) {
+        if (g_fmt_ctx->pb) avio_close(g_fmt_ctx->pb);
+        avformat_free_context(g_fmt_ctx);
+        g_fmt_ctx = NULL;
+    }
+    g_video_stream = NULL;
+    InterlockedExchange(&core->recording, 0);
+    InterlockedExchange(&core->paused, 0);
+    if (core->onStatusUpdate) core->onStatusUpdate("Resume failed - recording stopped");
+    if (core->onButtonUpdate) core->onButtonUpdate("START");
 }
 
 // ============================================================================
 // Status queries
 // ============================================================================
-
 int Core_IsRecording(const PhantomRecCore* core) {
     return InterlockedCompareExchange((LONG*)&core->recording, 1, 1);
 }
@@ -921,4 +1582,13 @@ int Core_IsConverting(const PhantomRecCore* core) {
 }
 int Core_GetProgress(const PhantomRecCore* core) {
     return core->convertProgress;
+}
+int Core_GetAudioStatus(const PhantomRecCore* core) {
+    return core->audioActive;
+}
+int Core_GetSegmentCount(const PhantomRecCore* core) {
+    return core->segmentCount;
+}
+long long Core_GetTotalBytes(const PhantomRecCore* core) {
+    return core->totalBytes;
 }
