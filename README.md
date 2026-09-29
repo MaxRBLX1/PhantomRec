@@ -2,7 +2,7 @@
 
 <img width="256" height="256" alt="Untitled" src="https://github.com/user-attachments/assets/9dec6e78-d9d8-4e4f-a491-fe130d9bc978" />  *The Icon Resembles "M" for MaxRBLX1*
 
-**Built by MaxRBLX1 — v1.9.8**
+**Built by MaxRBLX1 — v1.9.9**
 
 ## Project History
 
@@ -40,17 +40,36 @@ Encoded frames are handed to a **bounded writer ring** (64 slots). A separate th
 
 ### Stage 2 — Post-Convert (x264 ultrafast, when you stop)
 
-When you press STOP, PhantomRec muxes the video and audio together, then encodes the result with **x264 ultrafast** on all available CPU cores — after the game or app you were recording has been closed. You get a compact, shareable file without the recorder ever competing for GPU time.
+When you press STOP, PhantomRec muxes the video and audio together, then encodes the result with **x264 ultrafast**. Stage 2 runs with `BELOW_NORMAL_PRIORITY_CLASS` and half the CPU threads, so the machine stays usable while the encode runs in the background. You get a compact, shareable file without the recorder ever competing for GPU time.
+
+---
+
+## CPU Affinity — How PhantomRec Stays Out of the Way
+
+On **4 or more cores**, PhantomRec reserves **one core** (the second-to-last, `N-2`) for `maxenc.exe` alone. Everything else — games, browsers, the UI, `maxsound`, the OS — runs on the remaining cores. The reserved core gives the encoder a stable home so a busy system can't starve it.
+
+**Browsers are never restricted.** Chrome, Firefox, Edge, Opera GX, and every other browser need all cores to keep their compositor, renderer, and audio threads responsive. PhantomRec leaves them alone completely.
+
+On **2 cores**, PhantomRec reserves nothing. There is no spare core to reserve, and pinning the encoder to core 0 would put it on the GPU DPC core, which drops frames. Both cores stay available to everything, and `maxenc.exe`'s console thread is raised to `THREAD_PRIORITY_HIGHEST` so STOP and PAUSE respond immediately even when the encoder is mid-frame.
+
+**Running as administrator** gives PhantomRec permission to apply the reservation system-wide. Without elevation, PhantomRec still reserves a core for its own encoder child but cannot restrict other applications. Recording is unaffected either way — the reservation is an optimization, not a requirement.
 
 ---
 
 ## The Result
 
 - GPU encoder stays at 0% — no encoding on the GPU, ever.
-- Recording uses roughly **half of one CPU core** on a modern 4-core machine (measured: `maxenc.exe` at ~14% of total CPU on 4 cores).
+- Recording uses roughly **half of one CPU core** on a modern 4-core machine
+  (measured: `maxenc.exe` at ~14% of total CPU on 4 cores).
 - Heavy compression happens after you stop, not during recording.
 - No GPU encoder required. No NVENC. No AMF. No QuickSync. CPU only.
-- Runs on hardware from 2 cores up — verified on an Intel Core 2 Quad Q9550 limited to 2 cores.
+- Runs on hardware from 2 cores up — verified on an Intel Core 2 Quad Q9550
+  limited to 2 cores.
+
+<img width="543" height="105" alt="Screenshot 2026-09-29 044544"
+src="https://github.com/user-attachments/assets/10e5f942-254d-4a2e-9ba9-dc5e5af6cea8" />
+
+*Task Manager during a recording, on the Q9550 limited to 2 cores.*
 
 ---
 
@@ -96,9 +115,33 @@ PhantomRec doesn't care what hardware you have — it cares about your OS, becau
 
 ---
 
+## What's New in v1.9.9
+
+v1.9.9 finishes the CPU placement that 1.9.8 started. The pipeline itself is unchanged — this is about where the work runs, not what it does.
+
+### Affinity
+
+- **Single-core reservation on 4+ cores.** `maxenc.exe` is pinned to core `N-2` for the duration of the recording. Everything else runs on the remaining cores.
+- **No reservation on 2 cores.** Both cores stay available to everything. `maxenc.exe`'s console thread gets a priority boost so STOP and PAUSE respond immediately even when the encoder is mid-frame.
+- **Browsers are never restricted.** Chrome, Firefox, Edge, Opera GX — all of them keep every core. Restricting a browser makes its compositor wait for renderers, and the whole thing visibly janks.
+- **The 1.9.8 affinity scheme is gone.** It reserved two cores and tried to strip them from games, but never pinned `maxenc.exe` itself. The reserved cores sat idle and the encoder stayed on the noise cores. That is fixed.
+
+### Stage 2
+
+- **Runs politely.** `BELOW_NORMAL_PRIORITY_CLASS` and half the CPU threads (`-threads N/2`). The machine stays usable while x264 runs in the background.
+- **No affinity pin.** Stage 2 uses whatever the OS gives it.
+
+### Cleanup
+
+- **`MJPEGQuality` removed.** Stage 1 picks the intermediate quality automatically. There is no user-facing quality knob for the encoder, and that is deliberate. Legacy `MJPEGQuality=` keys in older `Settings.ini` files are ignored silently.
+- **Writer-error handling fixed.** If the disk write fails mid-recording, `maxenc.exe` now sets `g_stopRequested` and exits cleanly instead of trying to reopen the output file and printing a misleading "segment open failed" message.
+- **Dead variables removed** from the C++ UI.
+
+---
+
 ## What's New in v1.9.8
 
-v1.9.8 is the biggest update in months. Two months of work, one goal: smooth recording on any PC.
+The biggest update in months. Two months of work, one goal: smooth recording on any PC.
 
 ### Architecture changes
 
@@ -116,11 +159,6 @@ v1.9.8 is the biggest update in months. Two months of work, one goal: smooth rec
 - Fixed the audio child's inherited handle list so ffmpeg's stderr no longer goes to a stale handle.
 - Fixed `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` linkage on MSYS2 UCRT64.
 - In-process capture thread now distinguishes `AVERROR(EAGAIN)` from EOF and no longer loops on permanent source failure.
-
-### Known issues (targeted for 1.9.9)
-
-- **Dual-core STOP and PAUSE can feel slow.** On 2-core systems, PhantomRec and its child processes currently share a CPU core, so the console `q` signal can take up to a second to be processed. The fix is child-process CPU affinity, which will land in 1.9.9. **Recording itself is unaffected.**
-- **The UI thread blocks during Stage 2 conversion.** On long recordings, the window will be unresponsive while x264 runs. A worker-thread rewrite is planned for 1.9.9.
 
 ---
 
@@ -161,7 +199,6 @@ Hotkey=F10
 PauseHotkey=P
 ConvertAfterRecording=yes
 CaptureMethod=auto
-MJPEGQuality=85
 
 [Appearance]
 Background=C:\path\to\image.png
@@ -176,7 +213,8 @@ FontColor=16777215
 | `PauseHotkey` | Same format as `Hotkey`. |
 | `ConvertAfterRecording` | `yes` = compress after recording (recommended). `no` = keep the high-quality intermediate file. |
 | `CaptureMethod` | `auto` (default), `gfx`, `ddagrab`, `gdi`. |
-| `MJPEGQuality` | 1–100. Default 85. Lower values = smaller intermediate files, faster encode, slightly softer image. Try 40–50 on very old hardware. |
+
+> **Note:** `MJPEGQuality` is no longer read. Stage 1 picks the intermediate quality automatically. Legacy keys are ignored silently.
 
 ---
 
@@ -264,7 +302,7 @@ g++ -O2 -mwindows \
 - **Per-window capture** — PhantomRec captures the entire monitor.
 - **Game capture via hooking** — Planned for a future release (exclusive fullscreen support).
 - **GPU encoding** — Not now, not ever. That's the whole point.
-- **Microphone handling** — Planned for future release
+- **Microphone handling** — Planned for a future release.
 
 ---
 
