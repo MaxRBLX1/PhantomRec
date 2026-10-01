@@ -4,6 +4,9 @@
 
 **Built by MaxRBLX1 — v1.9.9**
 
+#Disclaimer
+**Don't use PhantomRec version 1.9.9 it is still in development and I don't recommend it use the previous 1.9.8 instead for stability and smooth recording**
+
 ## Project History
 
 PhantomRec was originally released as RetroRec (v1.0 – v1.7). The name was changed in v1.8.
