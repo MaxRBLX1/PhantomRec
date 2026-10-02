@@ -1,4 +1,4 @@
-// phantomrec_core.h — PhantomRec v1.9.8 Core Interface
+// phantomrec_core.h — PhantomRec v1.9.9 Core Interface
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 //
@@ -114,14 +114,7 @@ typedef struct {
     int                  audioSampleRate; // always 0
     int                  audioChannels;  // always 0
 	
-    int64_t       segmentAudioT0[MAX_SEGMENTS]; // always NULL
-
-    // ---- process monitor ----
-    HANDLE               hProcessMonitorThread;
-    volatile LONG        processMonitorRunning;
-    DWORD_PTR            ffmpegCoreMask;
-    char                 browserNames[32][64];
-    int                  browserCount;
+    int64_t       segmentAudioT0[MAX_SEGMENTS]; // unused, reserved
 
     // ---- stats ----
     long long            totalBytes;
