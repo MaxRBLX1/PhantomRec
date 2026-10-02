@@ -283,7 +283,7 @@ gcc -std=c11 -O2 \
 # Step 3: Build the C core
 gcc -std=c11 -O2 \
     -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
-    -c src/phantomrec_coreCopy.c -o phantomrec_core.o
+    -c src/phantomrec_core.c -o phantomrec_core.o
 
 # Step 4: Build the GUID definitions (WASAPI/KSDATAFORMAT symbols)
 gcc -std=c11 -O2 \
@@ -293,9 +293,9 @@ gcc -std=c11 -O2 \
 # Step 5: Build the C++ UI
 g++ -std=c++17 -O2 \
     -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
-    -c src/phantomrecCopy.cpp -o phantomrec_ui.o
+    -c src/phantomrec.cpp -o phantomrec_ui.o
 
-# Step 6: Compile the resource file (HD icon + version info)
+# Step 6: Compile the resource file (HD icon + version info) You can put your custom Icons here but it is planned on future release
 windres src/resource.rc -O coff -o resource.o
 
 # Step 7: Link with g++ (NOT gcc — the UI is C++)
