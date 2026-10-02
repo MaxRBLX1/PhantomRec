@@ -75,6 +75,8 @@ static LARGE_INTEGER g_qpcFreq = {0};
 
 static tjhandle g_tjc = NULL;
 
+static int g_boostConsolePriority = 0;
+
 static const char* ApiName(CaptureAPI api) {
     switch (api) {
     case API_GFX:     return "gfxcapture";
@@ -150,6 +152,11 @@ static BOOL WINAPI CtrlHandler(DWORD type) {
 
 static unsigned int __stdcall ConsoleKeyThread(void* param) {
     (void)param;
+
+    if (g_boostConsolePriority) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+
     while (!InterlockedCompareExchange(&g_stopRequested, 1, 1)) {
         if (_kbhit()) {
             int c = _getch();
@@ -440,6 +447,14 @@ int main(int argc, char** argv) {
     int fps = GetTargetFPS(api);
 
     QueryPerformanceFrequency(&g_qpcFreq);
+	
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        if (si.dwNumberOfProcessors <= 2) {
+            g_boostConsolePriority = 1;
+        }
+    }
 
     g_tjc = tjInitCompress();
     if (!g_tjc) {
@@ -629,6 +644,7 @@ int main(int argc, char** argv) {
 
             if (InterlockedCompareExchange(&g_wWriteError, 1, 1)) {
                 fprintf(stderr, "[maxenc] writer reported a write error\n");
+                InterlockedExchange(&g_stopRequested, 1);
                 break;
             }
             anyFrameWritten = 1;
