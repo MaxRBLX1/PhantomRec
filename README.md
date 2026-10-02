@@ -28,7 +28,7 @@ The design principle is simple: **the GPU belongs to the game, not the recorder.
 ### Stage 1 — Live Capture (MJPEG, CPU-only)
 
 - **GFX Capture / DDAGrab** use the GPU's copy engine to read the framebuffer, then hand the raw pixels to the CPU. One blit per frame, no GPU-side format conversion.
-- **MaxRBLX1's Fastest MJPEG** (`maxenc.exe`) encodes each frame with **libjpeg-turbo** (SIMD-accelerated JPEG) using a single thread on a pinned CPU core. This is a high-quality intermediate, not a lossless master.
+- **MaxRBLX1's Fastest MJPEG** (`maxenc.exe`) encodes each frame with **libjpeg-turbo** (SIMD-accelerated JPEG) using a single thread. The OS scheduler places the encode, writer, and console threads — PhantomRec doesn't pin them. This is a high-quality intermediate, not a lossless master.
 - **GDI fallback** works on any Windows version and any GPU — including Microsoft Basic Display Adapter — at up to 30 FPS.
 - The GPU encoder graph stays at **0%** because PhantomRec never touches it.
 
@@ -41,18 +41,6 @@ Encoded frames are handed to a **bounded writer ring** (64 slots). A separate th
 ### Stage 2 — Post-Convert (x264 ultrafast, when you stop)
 
 When you press STOP, PhantomRec muxes the video and audio together, then encodes the result with **x264 ultrafast**. Stage 2 runs with `BELOW_NORMAL_PRIORITY_CLASS` and half the CPU threads, so the machine stays usable while the encode runs in the background. You get a compact, shareable file without the recorder ever competing for GPU time.
-
----
-
-## CPU Affinity — How PhantomRec Stays Out of the Way
-
-On **4 or more cores**, PhantomRec reserves **one core** (the second-to-last, `N-2`) for `maxenc.exe` alone. Everything else — games, browsers, the UI, `maxsound`, the OS — runs on the remaining cores. The reserved core gives the encoder a stable home so a busy system can't starve it.
-
-**Browsers are never restricted.** Chrome, Firefox, Edge, Opera GX, and every other browser need all cores to keep their compositor, renderer, and audio threads responsive. PhantomRec leaves them alone completely.
-
-On **2 cores**, PhantomRec reserves nothing. There is no spare core to reserve, and pinning the encoder to core 0 would put it on the GPU DPC core, which drops frames. Both cores stay available to everything, and `maxenc.exe`'s console thread is raised to `THREAD_PRIORITY_HIGHEST` so STOP and PAUSE respond immediately even when the encoder is mid-frame.
-
-**Running as administrator** gives PhantomRec permission to apply the reservation system-wide. Without elevation, PhantomRec still reserves a core for its own encoder child but cannot restrict other applications. Recording is unaffected either way — the reservation is an optimization, not a requirement.
 
 ---
 
@@ -117,25 +105,59 @@ PhantomRec doesn't care what hardware you have — it cares about your OS, becau
 
 ## What's New in v1.9.9
 
-v1.9.9 finishes the CPU placement that 1.9.8 started. The pipeline itself is unchanged — this is about where the work runs, not what it does.
+### Two-stage pipeline, unchanged from 1.9.8
 
-### Affinity
+The core architecture is identical: MJPEG capture on one core with
+libjpeg-turbo, muxed with WASAPI audio, then re-encoded to x264 after you
+stop. Nothing about the pipeline changed.
 
-- **Single-core reservation on 4+ cores.** `maxenc.exe` is pinned to core `N-2` for the duration of the recording. Everything else runs on the remaining cores.
-- **No reservation on 2 cores.** Both cores stay available to everything. `maxenc.exe`'s console thread gets a priority boost so STOP and PAUSE respond immediately even when the encoder is mid-frame.
-- **Browsers are never restricted.** Chrome, Firefox, Edge, Opera GX — all of them keep every core. Restricting a browser makes its compositor wait for renderers, and the whole thing visibly janks.
-- **The 1.9.8 affinity scheme is gone.** It reserved two cores and tried to strip them from games, but never pinned `maxenc.exe` itself. The reserved cores sat idle and the encoder stayed on the noise cores. That is fixed.
+### Removed — process affinity system
 
-### Stage 2
+libjpeg-turbo is single-threaded and skips intra-frame prediction, so the
+encoder uses one core's worth of work and doesn't compete with anything
+else on the machine. Measurements across every capture path show
+`maxenc.exe` CPU cost is unchanged (10–15% of total on a 4-core machine)
+regardless of core placement.
 
-- **Runs politely.** `BELOW_NORMAL_PRIORITY_CLASS` and half the CPU threads (`-threads N/2`). The machine stays usable while x264 runs in the background.
-- **No affinity pin.** Stage 2 uses whatever the OS gives it.
+The 1.9.8 affinity system tried to reserve cores for the encoder, but the
+reservation added scheduling overhead without lowering the encoder's CPU
+cost. Removing it restores the OS's own thread placement, which is where
+the encoder always performed best.
+
+- **Process monitor, browser detection, and core reservation are gone.**
+- **No process affinity is changed, on any machine, at any time.**
+- **Dual-core console-thread priority boost is kept.** On 2-core machines,
+  `maxenc.exe`'s console thread runs at `THREAD_PRIORITY_HIGHEST` so STOP
+  and PAUSE respond immediately even when the encoder is mid-frame.
+- **Stage 2 runs at `BELOW_NORMAL_PRIORITY_CLASS` on half the CPU threads.**
+
+### Stage 2 — universal 60fps output
+
+Every recording now produces a 60fps CFR final file, regardless of capture
+method. GFX and DDAGrab already capture at 60fps; GDI captures at 30fps
+natively and Stage 2 duplicates each frame to fill the 60fps timeline. The
+output format is consistent across all three capture paths.
+
+GDI recordings take roughly 2× longer in Stage 2 because there are twice
+as many output frames to encode. Stage 2 runs in the background at
+`BELOW_NORMAL_PRIORITY_CLASS`, so the machine stays usable while it runs.
+
+### Desktop notification when a recording is saved
+
+When Stage 2 finishes, PhantomRec shows a system notification with the
+filename. Clicking it opens Explorer with the file selected.
+
+- **Windows 7 SP1, 8, 8.1** — classic tray balloon
+- **Windows 10, 11** — toast in the Action Center
+
+Uses `Shell_NotifyIcon`, the one notification API that renders natively on
+every Windows version PhantomRec supports. No WinRT dependency.
 
 ### Cleanup
 
-- **`MJPEGQuality` removed.** Stage 1 picks the intermediate quality automatically. There is no user-facing quality knob for the encoder, and that is deliberate. Legacy `MJPEGQuality=` keys in older `Settings.ini` files are ignored silently.
-- **Writer-error handling fixed.** If the disk write fails mid-recording, `maxenc.exe` now sets `g_stopRequested` and exits cleanly instead of trying to reopen the output file and printing a misleading "segment open failed" message.
-- **Dead variables removed** from the C++ UI.
+- `ts=wallclock` removed from the gdigrab path. It was a no-op — maxenc's
+  PTS comes from `QueryPerformanceCounter`, not from the demuxer.
+- Version strings updated.
 
 ---
 
