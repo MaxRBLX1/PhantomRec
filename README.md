@@ -1,4 +1,6 @@
-# PhantomRec — "Record with lightweight compression now. Encode with heavy compression later."
+# PhantomRec — WYSIWYG
+
+*What you see is what you get — while recording and in the final video.*
 
 <img width="256" height="256" alt="Untitled" src="https://github.com/user-attachments/assets/9dec6e78-d9d8-4e4f-a491-fe130d9bc978" />  *The Icon Resembles "M" for MaxRBLX1*
 
