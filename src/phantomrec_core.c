@@ -27,7 +27,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 
-#include "phantomrec_coreCopy.h"
+#include "phantomrec_core.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
