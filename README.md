@@ -278,7 +278,7 @@ gcc -std=c11 -O2 \
 gcc -std=c11 -O2 \
     -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -DNTDDI_VERSION=0x0A000000 \
     src/maxsound.c -o maxsound.exe \
-    -lole32 -luuid -lavformat -lavcodec -lavutil
+    -lole32 -luuid -lavrt
 
 # Step 3: Build the C core
 gcc -std=c11 -O2 \
