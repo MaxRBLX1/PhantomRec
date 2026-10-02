@@ -1,0 +1,39 @@
+#include <windows.h>
+#include "resource.h"
+
+// ============================================================
+// ICON
+// ============================================================
+IDI_MAIN_ICON  ICON  "PhantomRec.ico" // Rename with your custom ICON
+
+// ============================================================
+// VERSION INFO (so Explorer shows FileVersion, ProductName, etc.)
+// ============================================================
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,9,9,0
+PRODUCTVERSION  1,9,9,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"   // English (US) + Unicode
+        BEGIN
+            VALUE "CompanyName",        "MaxRBLX1"
+            VALUE "FileDescription",    "PhantomRec Screen Recorder"
+            VALUE "FileVersion",        "1.9.9"
+            VALUE "InternalName",       "PhantomRec"
+            VALUE "LegalCopyright",     "MaxRBLX1"
+            VALUE "OriginalFilename",   "PhantomRec.exe"
+            VALUE "ProductName",        "PhantomRec"
+            VALUE "ProductVersion",     "1.9.9"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
