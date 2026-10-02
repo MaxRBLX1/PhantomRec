@@ -181,7 +181,9 @@ static void RewriteWavSizes(HANDLE h) {
     WriteFile(h, &dataSize, 4, &wrote, NULL);
 
     // Trim the file to the real size.
-    SetFilePointer(h, 68 + (LONG)dataSize, NULL, FILE_BEGIN);
+    LARGE_INTEGER endPos;
+    endPos.QuadPart = 68 + (LONGLONG)dataSize;
+    SetFilePointerEx(h, endPos, NULL, FILE_BEGIN);
     SetEndOfFile(h);
 }
 
