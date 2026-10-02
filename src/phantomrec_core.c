@@ -1,4 +1,4 @@
-// phantomrec_core.c — PhantomRec v1.9.8 Pure C Core
+// phantomrec_core.c — PhantomRec v1.9.9 Pure C Core
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 //
@@ -17,8 +17,6 @@
 #include <ctype.h>
 #include <avrt.h>
 #include <process.h>
-#include <tlhelp32.h>
-#include <winreg.h>
 #include <turbojpeg.h>
 #include <libavdevice/avdevice.h>
 #include <libavformat/avformat.h>
@@ -37,9 +35,6 @@
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "advapi32.lib")
 
-#define MAX_BROWSERS 32
-#define MAX_BROWSER_NAME 64
-
 // ============================================================================
 // Globals
 // ============================================================================
@@ -54,11 +49,6 @@ static AVPacket*        g_mjpeg_pkt      = NULL;
 // ============================================================================
 // Forward declarations
 // ============================================================================
-static void RestoreAllProcessAffinities(PhantomRecCore* core);
-static void SetAllProcessesAffinityExcludingFFmpegCore(PhantomRecCore* core);
-static unsigned int __stdcall ProcessMonitorThread(void* param);
-static BOOL IsGraphicsProcess(DWORD processId);
-static BOOL IsBrowserProcess(PhantomRecCore* core, DWORD processId);
 static BOOL SendKeyToProcess(DWORD pid, WORD vk, char ch);
 static BOOL WINAPI PhantomCtrlHandler(DWORD type);
 
@@ -166,7 +156,8 @@ static BOOL SendKeyToProcess(DWORD pid, WORD vk, char ch) {
 // ============================================================================
 // Video child spawn / stop (maxenc.exe)
 // ============================================================================
-static BOOL SpawnVideoChild(const char* cmdline, PROCESS_INFORMATION* pi) {
+static BOOL SpawnVideoChild(PhantomRecCore* core, const char* cmdline,
+                            PROCESS_INFORMATION* pi) {
     STARTUPINFOA si = {0};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -328,21 +319,6 @@ static int QpcDeltaToMs(PhantomRecCore* core, int64_t audioTick, int64_t videoTi
 }
 
 // ============================================================================
-// CPU affinity
-// ============================================================================
-static DWORD_PTR GetSecondLastCoreAffinityMask(void) {
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    if (si.dwNumberOfProcessors >= 4) {
-        return ((DWORD_PTR)1 << (si.dwNumberOfProcessors - 1)) |
-               ((DWORD_PTR)1 << (si.dwNumberOfProcessors - 2));
-    } else if (si.dwNumberOfProcessors >= 2) {
-        return (DWORD_PTR)1 << (si.dwNumberOfProcessors - 2);
-    }
-    return (DWORD_PTR)1;
-}
-
-// ============================================================================
 // Capture method
 // ============================================================================
 static CaptureMethod g_UserCaptureMethod = CAPTURE_AUTO;
@@ -481,149 +457,6 @@ int Core_FindMaxsEngine(PhantomRecCore* core) {
 }
 
 // ============================================================================
-// Browser detection
-// ============================================================================
-static int GetInstalledBrowsers(char browserNames[][MAX_BROWSER_NAME], int maxBrowsers) {
-    HKEY hKey;
-    int browserCount = 0;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Clients\\StartMenuInternet",
-                      0, KEY_READ, &hKey) != ERROR_SUCCESS) return 0;
-    DWORD index = 0;
-    char browserName[MAX_PATH];
-    DWORD nameSize = sizeof(browserName);
-    while (browserCount < maxBrowsers &&
-           RegEnumKeyExA(hKey, index, browserName, &nameSize,
-                        NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
-        HKEY hBrowserKey;
-        char subKeyPath[MAX_PATH];
-        sprintf_s(subKeyPath, sizeof(subKeyPath),
-                  "SOFTWARE\\Clients\\StartMenuInternet\\%s\\shell\\open\\command",
-                  browserName);
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKeyPath, 0, KEY_READ, &hBrowserKey) == ERROR_SUCCESS) {
-            char commandLine[MAX_PATH * 2];
-            DWORD commandSize = sizeof(commandLine);
-            if (RegQueryValueExA(hBrowserKey, NULL, NULL, NULL,
-                                 (LPBYTE)commandLine, &commandSize) == ERROR_SUCCESS) {
-                char* exeStart = strrchr(commandLine, '\\');
-                if (exeStart) {
-                    exeStart++;
-                    char* exeEnd = strstr(exeStart, ".exe");
-                    if (exeEnd) {
-                        exeEnd += 4;
-                        int nameLen = (int)(exeEnd - exeStart);
-                        if (nameLen < MAX_BROWSER_NAME) {
-                            strncpy_s(browserNames[browserCount], MAX_BROWSER_NAME, exeStart, nameLen);
-                            browserCount++;
-                        }
-                    }
-                }
-            }
-            RegCloseKey(hBrowserKey);
-        }
-        index++;
-        nameSize = sizeof(browserName);
-    }
-    RegCloseKey(hKey);
-    return browserCount;
-}
-
-static BOOL IsBrowserProcess(PhantomRecCore* core, DWORD processId) {
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-    if (!hProcess) return FALSE;
-    char processPath[MAX_PATH];
-    DWORD pathSize = sizeof(processPath);
-    BOOL isBrowser = FALSE;
-    if (QueryFullProcessImageNameA(hProcess, 0, processPath, &pathSize)) {
-        char* fileName = strrchr(processPath, '\\');
-        if (fileName) fileName++; else fileName = processPath;
-        char lowerName[MAX_PATH];
-        for (int j = 0; fileName[j] && j < MAX_PATH - 1; j++) {
-            lowerName[j] = (char)tolower(fileName[j]);
-            lowerName[j + 1] = '\0';
-        }
-        for (int i = 0; i < core->browserCount; i++) {
-            char lowerBrowser[MAX_BROWSER_NAME];
-            for (int j = 0; core->browserNames[i][j] && j < MAX_BROWSER_NAME - 1; j++) {
-                lowerBrowser[j] = (char)tolower(core->browserNames[i][j]);
-                lowerBrowser[j + 1] = '\0';
-            }
-            if (strcmp(lowerName, lowerBrowser) == 0) { isBrowser = TRUE; break; }
-        }
-    }
-    CloseHandle(hProcess);
-    return isBrowser;
-}
-
-static BOOL IsGameProcess(PhantomRecCore* core, DWORD processId) {
-    if (IsBrowserProcess(core, processId)) return FALSE;
-    return IsGraphicsProcess(processId);
-}
-
-// ============================================================================
-// Process monitor
-// ============================================================================
-static unsigned int __stdcall ProcessMonitorThread(void* param) {
-    PhantomRecCore* core = (PhantomRecCore*)param;
-    while (core->processMonitorRunning) {
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot != INVALID_HANDLE_VALUE) {
-            PROCESSENTRY32 pe32;
-            pe32.dwSize = sizeof(PROCESSENTRY32);
-            if (Process32First(hSnapshot, &pe32)) {
-                do {
-                    if (pe32.th32ProcessID == 0 ||
-                        pe32.th32ProcessID == GetCurrentProcessId() ||
-                        pe32.th32ProcessID == core->ffmpegProcess.dwProcessId ||
-                        pe32.th32ProcessID == core->ffmpegAudioProcess.dwProcessId) continue;
-                    if (IsGameProcess(core, pe32.th32ProcessID)) {
-                        HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
-                                                      FALSE, pe32.th32ProcessID);
-                        if (hProcess) {
-                            DWORD_PTR processAffinity, systemAffinity;
-                            if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity)) {
-                                DWORD_PTR newAffinity = processAffinity & ~core->ffmpegCoreMask;
-                                if (newAffinity != 0 && newAffinity != processAffinity)
-                                    SetProcessAffinityMask(hProcess, newAffinity);
-                            }
-                            CloseHandle(hProcess);
-                        }
-                    }
-                } while (Process32Next(hSnapshot, &pe32));
-            }
-            CloseHandle(hSnapshot);
-        }
-        Sleep(1000);
-    }
-    return 0;
-}
-
-static void SetAllProcessesAffinityExcludingFFmpegCore(PhantomRecCore* core) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return;
-    PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-    if (Process32First(hSnapshot, &pe32)) {
-        do {
-            if (pe32.th32ProcessID == 0 || pe32.th32ProcessID == GetCurrentProcessId()) continue;
-            if (IsGameProcess(core, pe32.th32ProcessID)) {
-                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION,
-                                              FALSE, pe32.th32ProcessID);
-                if (hProcess) {
-                    DWORD_PTR processAffinity, systemAffinity;
-                    if (GetProcessAffinityMask(hProcess, &processAffinity, &systemAffinity)) {
-                        DWORD_PTR newAffinity = processAffinity & ~core->ffmpegCoreMask;
-                        if (newAffinity != 0 && newAffinity != processAffinity)
-                            SetProcessAffinityMask(hProcess, newAffinity);
-                    }
-                    CloseHandle(hProcess);
-                }
-            }
-        } while (Process32Next(hSnapshot, &pe32));
-    }
-    CloseHandle(hSnapshot);
-}
-
-// ============================================================================
 // Command builders
 // ============================================================================
 static void BuildMaxEncCommand(PhantomRecCore* core, const char* outputFile,
@@ -641,34 +474,6 @@ static void BuildMaxEncCommand(PhantomRecCore* core, const char* outputFile,
     sprintf_s(cmdLine, cmdSize,
         "\"%s\" \"%s\" %d %s \"%s\"",
         core->maxencPath, outputFile, quality, apiStr, core->maxsenginePath);
-}
-
-// ============================================================================
-// Graphics process detection
-// ============================================================================
-static BOOL IsGraphicsProcess(DWORD processId) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return FALSE;
-    MODULEENTRY32 me32;
-    me32.dwSize = sizeof(MODULEENTRY32);
-    BOOL isGraphics = FALSE;
-    if (Module32First(hSnapshot, &me32)) {
-        do {
-            char lowerName[MAX_PATH];
-            for (int j = 0; me32.szModule[j] && j < MAX_PATH - 1; j++) {
-                lowerName[j] = (char)tolower(me32.szModule[j]);
-                lowerName[j + 1] = '\0';
-            }
-            if (strstr(lowerName, "d3d") || strstr(lowerName, "dxgi") ||
-                strstr(lowerName, "opengl") || strstr(lowerName, "vulkan") ||
-                strstr(lowerName, "gles") || strstr(lowerName, "egl")) {
-                isGraphics = TRUE;
-                break;
-            }
-        } while (Module32Next(hSnapshot, &me32));
-    }
-    CloseHandle(hSnapshot);
-    return isGraphics;
 }
 
 // ============================================================================
@@ -696,17 +501,6 @@ void Core_Init(PhantomRecCore* core, const char* maxsenginePath, const char* out
     InterlockedExchange(&core->recording, 0);
     InterlockedExchange(&core->paused, 0);
     InterlockedExchange(&core->converting, 0);
-
-    core->browserCount = GetInstalledBrowsers(core->browserNames, MAX_BROWSERS);
-
-    core->ffmpegCoreMask = GetSecondLastCoreAffinityMask();
-    SetAllProcessesAffinityExcludingFFmpegCore(core);
-
-    core->processMonitorRunning = 1;
-    core->hProcessMonitorThread = (HANDLE)_beginthreadex(NULL, 0, ProcessMonitorThread, core, 0, NULL);
-
-    DWORD_PTR uiAffinityMask = ~core->ffmpegCoreMask;
-    SetProcessAffinityMask(GetCurrentProcess(), uiAffinityMask);
 }
 
 static BOOL WINAPI PhantomCtrlHandler(DWORD type) {
@@ -796,20 +590,7 @@ void Core_CleanupOrphanedTempFiles(PhantomRecCore* core) {
 // Core shutdown
 // ============================================================================
 void Core_Shutdown(PhantomRecCore* core) {
-    core->processMonitorRunning = 0;
-    if (core->hProcessMonitorThread) {
-        WaitForSingleObject(core->hProcessMonitorThread, 1000);
-        CloseHandle(core->hProcessMonitorThread);
-        core->hProcessMonitorThread = NULL;
-    }
-
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    DWORD_PTR allCoresMask = 0;
-    for (DWORD i = 0; i < si.dwNumberOfProcessors; i++) allCoresMask |= (DWORD_PTR)1 << i;
-    SetProcessAffinityMask(GetCurrentProcess(), allCoresMask);
-
-    RestoreAllProcessAffinities(core);
+    (void)core;
     if (g_fmt_ctx) {
         if (g_fmt_ctx->pb) avio_close(g_fmt_ctx->pb);
         avformat_free_context(g_fmt_ctx);
@@ -820,30 +601,6 @@ void Core_Shutdown(PhantomRecCore* core) {
 
     if (g_tjc) { tjDestroy(g_tjc); g_tjc = NULL; }
     if (g_mjpeg_pkt) { av_packet_free(&g_mjpeg_pkt); g_mjpeg_pkt = NULL; }
-}
-
-static void RestoreAllProcessAffinities(PhantomRecCore* core) {
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return;
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    DWORD_PTR allCoresMask = 0;
-    for (DWORD i = 0; i < si.dwNumberOfProcessors; i++) allCoresMask |= (DWORD_PTR)1 << i;
-    PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-    if (Process32First(hSnapshot, &pe32)) {
-        do {
-            if (pe32.th32ProcessID == 0 || pe32.th32ProcessID == GetCurrentProcessId()) continue;
-            if (IsGameProcess(core, pe32.th32ProcessID)) {
-                HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
-                if (hProcess) {
-                    SetProcessAffinityMask(hProcess, allCoresMask);
-                    CloseHandle(hProcess);
-                }
-            }
-        } while (Process32Next(hSnapshot, &pe32));
-    }
-    CloseHandle(hSnapshot);
 }
 
 // ============================================================================
@@ -1020,6 +777,12 @@ int Core_StartRecording(PhantomRecCore* core) {
     if (InterlockedCompareExchange(&core->recording, 1, 1) == 1) return 0;
     if (InterlockedCompareExchange(&core->converting, 1, 1) == 1) return 0;
 
+    // Tell the user we're preparing. This is the window during which
+    // maxenc.exe is starting up and nothing is being captured yet.
+    // Without this message the UI looks frozen.
+    if (core->onStatusUpdate) core->onStatusUpdate("Arming capture...");
+    if (core->onButtonUpdate) core->onButtonUpdate("ARMING...");
+
     Core_DetectResolution(core);
 
     char ts[64];
@@ -1056,13 +819,27 @@ int Core_StartRecording(PhantomRecCore* core) {
     if (useMaxEncChild) {
         char videoCmd[8196];
         BuildMaxEncCommand(core, core->tempFile, videoCmd, sizeof(videoCmd));
-        if (!SpawnVideoChild(videoCmd, &core->ffmpegProcess)) {
+        if (!SpawnVideoChild(core, videoCmd, &core->ffmpegProcess)) {
             if (core->onStatusUpdate) core->onStatusUpdate("maxenc.exe spawn failed - using in-process MJPEG");
             core->videoEncoder = 2;
             useMaxEncChild = 0;
         } else {
-            QueryPerformanceCounter(&core->segmentStartTime);
-            QueryPerformanceCounter(&core->recStart);
+            // Wait for maxenc's first captured frame so recStart reflects
+            // the actual start of the video timeline, not process spawn time.
+            // 2 seconds is generous; on every machine tested so far the
+            // marker appears within 200-800ms.
+            int64_t videoT0 = WaitT0Marker(core->tempFile, 2000);
+            core->segmentVideoT0[0] = videoT0;
+
+            if (videoT0 != 0) {
+                core->segmentStartTime.QuadPart = videoT0;
+                core->recStart.QuadPart = videoT0;
+            } else {
+                // Fallback: marker never appeared. Fall back to spawn time.
+                QueryPerformanceCounter(&core->segmentStartTime);
+                QueryPerformanceCounter(&core->recStart);
+            }
+
             core->sessions++;
             g_captureRunning = 1;
             g_hCaptureThread = (HANDLE)_beginthreadex(NULL, 0, CaptureThreadExternal, core, 0, NULL);
@@ -1351,15 +1128,23 @@ void Core_StopRecording(PhantomRecCore* core) {
         if (core->onStatusUpdate) core->onStatusUpdate("Processing video...");
         if (core->onButtonUpdate) core->onButtonUpdate("Processing...");
 
-        int targetFPS = (core->cpuCoreCount >= 4) ? 60 : 55;
+        int x264Threads = core->cpuCoreCount / 2;
+        if (x264Threads < 1) x264Threads = 1;
+
+        // Universal 60fps CFR output on every capture path. GFX and
+        // DDAGrab already deliver 60fps; GDI delivers 30fps natively
+        // and Stage 2 duplicates each frame to fill the 60fps timeline.
+        // Same output format regardless of which capture API ran.
         char cmdLine[8196];
         sprintf_s(cmdLine, sizeof(cmdLine),
             "\"%s\" -y -progress pipe:1 -loglevel error -i \"%s\" "
+            "-r 60 -vsync cfr "
             "-c:v libx264 -preset ultrafast -crf %d -color_range tv "
             "-c:a aac -b:a 96k -af aresample=async=1 "
-            "-pix_fmt yuv420p -r %d -fps_mode cfr "
+            "-pix_fmt yuv420p -threads %d "
             "-movflags +faststart \"%s\"",
-            core->maxsenginePath, losslessFile, core->crf, targetFPS, core->finalFile);
+            core->maxsenginePath, losslessFile,
+            core->crf, x264Threads, core->finalFile);
 
         HANDLE hRead, hWrite;
         SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
@@ -1376,7 +1161,7 @@ void Core_StopRecording(PhantomRecCore* core) {
         PROCESS_INFORMATION convertPI = {0};
 
         if (CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
-            CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS,
+            CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
             NULL, NULL, &siConv, &convertPI)) {
             CloseHandle(hWrite);
             char buf[512];
@@ -1507,7 +1292,7 @@ void Core_TogglePause(PhantomRecCore* core) {
     if (core->videoEncoder == 0) {
         char videoCmd[8196];
         BuildMaxEncCommand(core, newSeg, videoCmd, sizeof(videoCmd));
-        if (!SpawnVideoChild(videoCmd, &core->ffmpegProcess)) goto resume_fail;
+        if (!SpawnVideoChild(core, videoCmd, &core->ffmpegProcess)) goto resume_fail;
     } else {
         if (avformat_alloc_output_context2(&g_fmt_ctx, NULL, "matroska", newSeg) < 0) goto resume_fail;
         av_opt_set_int(g_fmt_ctx, "max_muxing_queue_size", 8192, AV_OPT_SEARCH_CHILDREN);
