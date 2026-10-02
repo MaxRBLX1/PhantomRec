@@ -1,8 +1,8 @@
-// PhantomRec.cpp — PhantomRec v1.9.8 C++ UI
+// PhantomRec.cpp — PhantomRec v1.9.9 C++ UI
 // "Every screen deserves to be recorded."
 // Built by MaxRBLX1
 // Max'sEngine™ | Pure C Core + C++ UI
-// v1.9.8: Stage 1 is MaxRBLX1's Fastest MJPEG only. Huffyuv removed.
+// v1.9.9: removed process affinity, universal 60fps Stage 2, tray notification.
 
 #include "phantomrec_coreCopy.h"
 
@@ -27,7 +27,7 @@ using Microsoft::WRL::ComPtr;
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 
-#define PHANTOMREC_VERSION "1.9.8"
+#define PHANTOMREC_VERSION "1.9.9"
 #define ID_BTN_RECORD 1001
 #define ID_BTN_SETTINGS 1002
 #define ID_HOTKEY_RECORD 1
@@ -89,10 +89,7 @@ static Gdiplus::Image* g_cachedBgImage = nullptr;
 static std::string g_cachedBgPath;
 
 // Font handles for main window controls
-static HFONT g_hStatusFont = nullptr;
 static HFONT g_hButtonFont = nullptr;
-static HFONT g_hStaticFont = nullptr;
-static HFONT g_hBtnStaticFont = nullptr;
 
 using namespace Gdiplus;
 
@@ -107,8 +104,6 @@ struct GifPreviewState {
     UINT frameDelay;
     bool isGif;
 };
-
-static GifPreviewState g_previewGifState = {0};
 
 // WIC animated background state
 struct WicAnimatedBg {
@@ -126,7 +121,7 @@ static WicAnimatedBg g_wicBg;
 static void UpdateUI();
 static void DoUpdateStatus(const char* message);
 static void DoUpdateButton(const char* text);
-
+static void ShowRecordingSavedNotification(const char* filePath);
 // ============================================================================
 // Helper: Draw text with stroke
 // ============================================================================
@@ -218,6 +213,7 @@ static void OnConversionDone(int success, const char* filePath) {
             long long fs = Core_GetFileSize(filePath);
             Core_FormatSize(fs, buf, sizeof(buf));
             DoUpdateStatus(buf);
+			ShowRecordingSavedNotification(filePath);
             ShellExecuteA(nullptr, "open", "explorer",
                 ("/select,\"" + std::string(filePath) + "\"").c_str(), nullptr, SW_SHOWNORMAL);
         } else {
@@ -296,7 +292,7 @@ static std::string GetHotkeyName(UINT vk) {
 static void CreateDefaultIni() {
     std::ofstream ini(g_iniPath);
     ini << "; ============================================================\r\n"
-        << "; PhantomRec v1.9.8 Settings\r\n"
+        << "; PhantomRec v1.9.9 Settings\r\n"
         << "; Built by MaxRBLX1\r\n"
         << "; Max'sEngine(tm) Powered by FFmpeg\r\n"
         << "; ============================================================\r\n"
@@ -311,9 +307,10 @@ static void CreateDefaultIni() {
         << ";             x264 ultrafast.\r\n"
         << ";             Compresses the master into a small final .mkv.\r\n"
         << ";\r\n"
-        << "; There is no encoder setting to change. Both stages pick the\r\n"
-        << "; best options for your hardware automatically. The only knob\r\n"
-        << "; that affects video quality is MJPEGQuality below.\r\n"
+        << "; There is no encoder or quality setting to change. Both stages\r\n"
+        << "; pick the best options for your hardware automatically. If you\r\n"
+        << "; are looking for a knob to turn, there isn't one, and that is\r\n"
+        << "; deliberate.\r\n"
         << ";\r\n"
         << "; ============================================================\r\n"
         << "; Hotkey - start or stop a recording\r\n"
@@ -333,20 +330,13 @@ static void CreateDefaultIni() {
         << ";   gfx       D3D11 Graphics Capture      (Win10+, 60 FPS)\r\n"
         << ";   ddagrab   DXGI Desktop Duplication    (Win8+, 60 FPS)\r\n"
         << ";   gdi       GDI software capture        (any Windows, up to 30 FPS)\r\n"
-        << ";\r\n"
-        << "; MJPEGQuality - the quality of the recording\r\n"
-        << ";   1     smallest master, lowest quality\r\n"
-        << ";   75    balanced (default)\r\n"
-        << ";   100   best quality, larger master\r\n"
-        << ";   On slow PCs try 40-60. On fast PCs try 85-95.\r\n"
         << "; ============================================================\r\n"
         << "\r\n"
         << "[Settings]\r\n"
         << "Hotkey=F10\r\n"
         << "PauseHotkey=P\r\n"
         << "ConvertAfterRecording=yes\r\n"
-        << "CaptureMethod=auto\r\n"
-        << "MJPEGQuality=85\r\n";
+        << "CaptureMethod=auto\r\n";
     ini.close();
 }
 
@@ -373,14 +363,6 @@ static void LoadConfiguration() {
         Core_SetCaptureMethodEx(&g_Core, CAPTURE_GDI);
     else
         Core_SetCaptureMethodEx(&g_Core, CAPTURE_AUTO);
-
-    // Stage 1 is MaxRBLX1's Fastest MJPEG. videoEncoder is set by the core
-    // at record time (0 = maxenc.exe, 2 = in-process). No INI key controls it.
-    // Legacy "Codec=" keys in older Settings.ini files are ignored silently.
-
-    g_Core.mjpegQuality = GetPrivateProfileIntA("Settings", "MJPEGQuality", 75, g_iniPath.c_str());
-    if (g_Core.mjpegQuality < 1)   g_Core.mjpegQuality = 1;
-    if (g_Core.mjpegQuality > 100) g_Core.mjpegQuality = 100;
 
     HANDLE hFile = CreateFileA(g_iniPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1178,7 +1160,6 @@ static void UpdateUI() {
         "Threads: %d (conversion)\r\n"
         "Capture: %s\r\n"
         "Codec: %s\r\n"
-        "MJPEG Quality: %d\r\n"
         "CRF: %d\r\n"
         "Resolution: %dx%d\r\n"
         "Audio: %s (system loopback)\r\n"
@@ -1192,7 +1173,6 @@ static void UpdateUI() {
         displayThreads,
         Core_GetCaptureMethodDesc(&g_Core),
         "MaxRBLX1's Fastest MJPEG",
-        g_Core.mjpegQuality,
         g_Core.crf,
         g_Core.screenWidth, g_Core.screenHeight,
         audioActive ? "available" : "unavailable",
@@ -1235,6 +1215,81 @@ static void DrawMainUITextWithStroke(HDC hdc, const RECT& rect, const std::strin
 
     DrawTextWithStroke(&graphics, wtext.c_str(), &font, layoutRect,
                        colorText, colorStroke, (REAL)strokeWidth);
+}
+
+// ============================================================================
+// Recording-saved tray notification
+// ============================================================================
+// Uses Shell_NotifyIcon, which is the one notification API that renders
+// natively on every Windows version PhantomRec supports:
+//   Windows 7 SP1 / 8 / 8.1 -> classic balloon tip
+//   Windows 10 / 11         -> toast in the Action Center
+// The tray icon is added on demand and removed 10 seconds later.
+
+#define WM_TRAY_NOTIFY        (WM_APP + 30)
+#define TRAY_ICON_ID          1
+#define TRAY_CLEANUP_TIMER    5001
+
+static NOTIFYICONDATAW g_nid = {0};
+static bool            g_trayIconAdded = false;
+static std::string     g_lastRecordingPath;
+
+static void TrayNotifyAddIfNeeded() {
+    if (g_trayIconAdded) return;
+    memset(&g_nid, 0, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd   = g_hWnd;
+    g_nid.uID    = TRAY_ICON_ID;
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.uCallbackMessage = WM_TRAY_NOTIFY;
+
+    g_nid.hIcon = (HICON)LoadImageA(GetModuleHandleA(NULL),
+                                    MAKEINTRESOURCE(IDI_MAIN_ICON),
+                                    IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+
+    wcscpy(g_nid.szTip, L"PhantomRec");
+
+    if (Shell_NotifyIconW(NIM_ADD, &g_nid)) {
+        g_trayIconAdded = true;
+    }
+}
+
+static void TrayNotifyRemove() {
+    if (!g_trayIconAdded) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    g_trayIconAdded = false;
+}
+
+static void ShowRecordingSavedNotification(const char* filePath) {
+    if (!g_hWnd || !IsWindow(g_hWnd)) return;
+    if (!filePath || !filePath[0]) return;
+
+    g_lastRecordingPath = filePath;
+    TrayNotifyAddIfNeeded();
+
+    const char* fileName = strrchr(filePath, '\\');
+    fileName = fileName ? fileName + 1 : filePath;
+
+    wchar_t wFileName[MAX_PATH] = {0};
+    MultiByteToWideChar(CP_ACP, 0, fileName, -1, wFileName, MAX_PATH);
+
+    wcscpy(g_nid.szInfoTitle, L"PhantomRec \u2014 Recording saved");
+    wcscpy(g_nid.szInfo, L"Your recording is ready. Click to open the folder.\n");
+    size_t used = wcslen(g_nid.szInfo);
+    if (used < 250) {
+        wcsncpy(g_nid.szInfo + used, wFileName, 255 - used);
+        g_nid.szInfo[255] = 0;
+    }
+
+    g_nid.uFlags      = NIF_INFO;
+    g_nid.dwInfoFlags = NIIF_INFO;
+    g_nid.uTimeout    = 6000;
+
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+
+    KillTimer(g_hWnd, TRAY_CLEANUP_TIMER);
+    SetTimer(g_hWnd, TRAY_CLEANUP_TIMER, 10000, NULL);
 }
 
 // ============================================================================
@@ -1283,6 +1338,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (filePath) free(filePath);
         return 0;
     }
+    case WM_TRAY_NOTIFY:
+        if (LOWORD(l) == WM_LBUTTONUP || LOWORD(l) == NIN_BALLOONUSERCLICK) {
+            if (!g_lastRecordingPath.empty()) {
+                ShellExecuteA(nullptr, "open", "explorer",
+                    ("/select,\"" + g_lastRecordingPath + "\"").c_str(),
+                    nullptr, SW_SHOWNORMAL);
+            }
+        }
+        return 0;
     case WM_APP_REFRESH_FONTS: {
         if (!g_customFont.empty() && FileExists(g_customFont)) {
             AddFontResourceExA(g_customFont.c_str(), FR_PRIVATE, 0);
@@ -1528,6 +1592,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_TIMER:
         if (w == ID_TIMER_UPDATE) UpdateUI();
         else if (w == ID_TIMER_INI_CHECK) ReloadIniIfChanged();
+        else if (w == TRAY_CLEANUP_TIMER) {
+            KillTimer(h, TRAY_CLEANUP_TIMER);
+            TrayNotifyRemove();
+        }
         else if (w == 3001 && g_gifImage && g_gifFrameCount > 1) {
             g_gifCurrentFrame = (g_gifCurrentFrame + 1) % g_gifFrameCount;
             GUID pageGuid = FrameDimensionTime;
@@ -1563,10 +1631,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
 
     case WM_DESTROY: {
-        if (g_hStatusFont) DeleteObject(g_hStatusFont);
+		TrayNotifyRemove(); 
         if (g_hButtonFont) DeleteObject(g_hButtonFont);
-        if (g_hStaticFont) DeleteObject(g_hStaticFont);
-        if (g_hBtnStaticFont) DeleteObject(g_hBtnStaticFont);
 
         if (Core_IsRecording(&g_Core)) Core_StopRecording(&g_Core);
 
@@ -1681,15 +1747,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     EnsureBackgroundCached();
 
     ShowWindow(g_hWnd, nCmdShow);
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    DWORD_PTR ffmpegCoreMask = (DWORD_PTR)1 << (si.dwNumberOfProcessors - 2);
-
-    DWORD_PTR validCoresMask = (DWORD_PTR)((1ULL << si.dwNumberOfProcessors) - 1);
-
-    DWORD_PTR uiAffinityMask = (~ffmpegCoreMask) & validCoresMask;
-
-    SetProcessAffinityMask(GetCurrentProcess(), uiAffinityMask);
     UpdateWindow(g_hWnd);
     PostMessageA(g_hWnd, WM_APP_REFRESH_FONTS, 0, 0);
 
