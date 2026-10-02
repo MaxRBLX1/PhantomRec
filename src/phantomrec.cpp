@@ -4,7 +4,7 @@
 // Max'sEngine™ | Pure C Core + C++ UI
 // v1.9.9: removed process affinity, universal 60fps Stage 2, tray notification.
 
-#include "phantomrec_coreCopy.h"
+#include "phantomrec_core.h"
 
 #include <windows.h>
 #include <shellapi.h>
