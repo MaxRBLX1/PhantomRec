@@ -15,13 +15,7 @@ All recordings and settings from previous versions are fully compatible.
 
 ## What is PhantomRec?
 
-PhantomRec is a free, portable, invisible screen recorder for Windows.
-It captures your desktop with system audio, then converts the recording into a compact, high-quality file after you stop.
-
-No GPU? No problem. Old laptop? It works.
-PhantomRec runs on Windows 7 SP1 through Windows 11, from a dual-core budget machine to a high-end workstation.
-
-The design principle is simple: **the GPU belongs to the game, not the recorder.** PhantomRec never calls NVENC, AMF, or QuickSync. Encoding happens on the CPU, which leaves the GPU encoder graph flat at 0% while you record.
+**PhantomRec** is a free, portable, invisible screen recorder for Windows 7, 8, 8.1, 10, and 11. It records smoothly on machines where OBS, Bandicam, and FRAPS lag your game — including dual-core CPUs, no GPU, and Microsoft Basic Display Adapter. It never uses NVENC, AMF, or QuickSync.
 
 ---
 
