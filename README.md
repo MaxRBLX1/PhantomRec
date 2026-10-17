@@ -15,7 +15,7 @@ All recordings and settings from previous versions are fully compatible.
 
 ## What is PhantomRec?
 
-**PhantomRec** is a free, portable, invisible screen recorder for Windows 7, 8, 8.1, 10, and 11. It records smoothly on machines where OBS, Bandicam, and FRAPS lag your game — including dual-core CPUs, no GPU, and Microsoft Basic Display Adapter. It never uses NVENC, AMF, or QuickSync.
+**PhantomRec** is a free, portable, invisible screen recorder for Windows 7, 8, 8.1, 10, and 11. It records smoothly on machines where other recorders except fraps and d3dgear lag your game — including dual-core CPUs, no GPU, and Microsoft Basic Display Adapter. It never uses NVENC, AMF, or QuickSync.
 
 ---
 
